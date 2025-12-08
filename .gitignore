@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.lock
+.ipynb_checkpoints
+.vscode/
+.DS_Store
+logs/
+data/
+.venv/

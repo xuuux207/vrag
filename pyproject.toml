@@ -1,0 +1,39 @@
+[project]
+name = "tts-rag-workshop"
+version = "0.1.0"
+description = "虚拟销售 AI 系统 - RAG 实验开发项目"
+requires-python = ">=3.8"
+dependencies = [
+    "openai>=1.0.0",
+    "python-dotenv>=0.19.0",
+    "numpy>=1.20.0",
+    "requests>=2.28.0",
+    "jieba>=0.42.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter>=1.0.0",
+    "ipython>=7.0.0",
+    "pandas>=1.1.0",
+    "tabulate>=0.8.0",
+    "pytest>=6.0.0",
+    "pytest-benchmark>=3.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["experiment"]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.0.0",
+    "ipython>=7.0.0",
+    "pandas>=1.1.0",
+    "tabulate>=0.8.0",
+    "pytest>=6.0.0",
+    "pytest-benchmark>=3.4.0",
+]
