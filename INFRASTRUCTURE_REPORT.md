@@ -9,15 +9,18 @@
 tts/
 ├── .env                        # API 配置（已验证）
 ├── .env.example                # 配置模板
-├── requirements.txt            # 项目依赖
+├── requirements.txt            # 项目依赖（与 pyproject.toml 同步）
 ├── pyproject.toml              # uv 项目配置
 ├── uv.lock                     # 依赖锁定文件
 │
 ├── rag_utils.py                # ✅ 核心 RAG 工具库
 ├── conftest.py                 # ✅ Pytest 配置
 │
-├── test_api_tokens.py          # ✅ API Token 验证脚本
-├── verify_infrastructure.py    # ✅ 基础设施验证脚本
+├── scripts/                    # 工具脚本目录
+│   ├── README.md               # 脚本使用说明
+│   ├── run_clean.sh            # ✅ 环境清理包装脚本
+│   ├── test_api_tokens.py      # ✅ API Token 验证脚本
+│   └── verify_infrastructure.py # ✅ 基础设施验证脚本
 │
 ├── data/
 │   └── knowledge_base.py       # ✅ 测试知识库数据（6个文档）
@@ -105,17 +108,17 @@ Reranking 服务  : ✅ 通过
 
 ### 安装依赖
 ```bash
-uv pip install -r requirements.txt
+uv sync
 ```
 
 ### 验证 API Token
 ```bash
-uv run python test_api_tokens.py
+./scripts/run_clean.sh uv run python scripts/test_api_tokens.py
 ```
 
 ### 验证基础设施
 ```bash
-uv run python verify_infrastructure.py
+./scripts/run_clean.sh uv run python scripts/verify_infrastructure.py
 ```
 
 ### 使用核心工具库
