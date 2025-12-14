@@ -246,9 +246,43 @@ final_context = merge(graph_results, doc_results)
     └─ 基于 qwen3-8b + RAG（复用实验一结论）
 ```
 
+### 1.4 Agent 式多步检索编排（复用原始设计亮点）
+
+为保留原始设计中「基于 Agent 的多步检索」优势，在混合检索框架外再增加一个轻量 Agent 层，用于拆解复杂查询并按需触发不同数据源：
+
+1. **意图识别**：LLM 先判断查询是否需要图谱关系、历史案例或产品策略等不同信息块。
+2. **检索规划**：Agent 根据意图生成一个小型计划（如“先查企业背景→再拉案例→验证库存”）。
+3. **多步执行**：每一步调用 `hybrid_search()`，但附带不同的系统提示/过滤条件（例如限定数据源、企业名称、时间范围）。
+4. **上下文整合**：Agent 把每一步的成果写入记忆，直到覆盖查询中的所有槽位，再交给 LLM 生成最终回答。
+
+伪代码示例：
+
+```python
+plan = agent.plan(query)
+context_chunks = []
+for step in plan:
+    search_kwargs = step.to_kwargs()
+    results, debug = hybrid_search(query=step.prompt, **search_kwargs)
+    context_chunks.append({"step": step.name, "docs": results, "latency": debug["latency"]})
+
+final_answer = llm.generate(query, context_chunks)
+```
+
+这种 Agent 式编排可以：
+- ✅ 显式展示检索链路，方便结合延迟指标做逐步优化
+- ✅ 支持“先结构化后非结构化”“图谱→文档→FAQ”一类多 Hop 检索
+- ✅ 与实验一中的管控策略（如输出格式校验）保持一致，减少新增工程成本
+
 ---
 
 ## 2. 数据设计
+
+### 2.0 数据总体原则（延续实验一主题）
+
+- **行业背景沿用实验一**：继续围绕虚构厂商 TechFlow 与其虚拟客户生态，保证故事线一致、便于横向对比。
+- **数据形态覆盖三类源**：结构化（企业图谱）、非结构化（业务文档）、知识图谱（显式关系边），与最初“左手 + 右手 + 图谱”设想一致。
+- **完全虚构且可控**：所有实体、项目、关系均为虚构，避免命中真实训练语料；必要时通过脚本统一生成并打水印字段，如 `source: "synthetic_v2"`。
+- **延迟可观测**：在生成数据时即记录 size、token 数等统计，方便后续估算检索与生成耗时。
 
 ### 2.1 虚构企业图谱（新增）
 
@@ -408,6 +442,13 @@ def company_to_documents(company: Dict) -> List[Dict]:
     return docs
 ```
 
+### 2.5 多源耦合策略
+
+- **结构化 → 文本化**：企业图谱（结构化表 + 知识图谱）先按 `company_to_documents()` 规则生成描述性段落，再与实验一复用的 FICTIONAL_DOCUMENTS 一起进入同一检索索引，保证“左手 + 右手”真正融合。
+- **知识图谱保持显式边**：除文本化外，`COMPANY_RELATIONS` 仍以边列表方式存储，供 Agent 在需要“母子公司/投资链”推理时直接遍历，保留原始设计中“结构化 + 知识图谱”并存的能力。
+- **主题对齐**：所有公司、产品均围绕 TechFlow 及其实验一虚构产品线展开，回答中可以自然引用实验一的评测结论（例如推荐 qwen3-8b）。
+- **可扩展性**：将三类数据都标注 `source_type`（graph/doc/edge），便于统计不同数据源的贡献度和延迟，占位以支持后续接入真实企业数据。
+
 ---
 
 ## 3. 测试用例设计
@@ -557,6 +598,13 @@ def company_to_documents(company: Dict) -> List[Dict]:
 | **Baseline C** | 图谱+文档 | Dense 向量 | 融合但关键词匹配弱 |
 | **方案 D（推荐）** | 图谱+文档 | BM25 + Dense 混合 | 最全面准确 |
 
+### 4.4 延迟可观测性（客户延时敏感需求）
+
+- **分阶段打点**：`hybrid_search()` 输出的 `debug_info["latency"]` 记录 BM25、Dense、RRF、候选准备、Rerank 等耗时；Agent 层再额外记录规划、LLM 生成的耗时，形成“检索→生成”全链路时间线。
+- **可视化方式**：实验脚本生成 `outputs/experiment2_latency_breakdown.json` 与折线/堆叠柱状图，展示不同方案、不同公司查询的 P50/P95 延迟。
+- **告警阈值**：设置 500ms 软阈值；若某阶段超阈值即写入 log，并在回答附带“本次检索耗时偏高”提示，便于与客户同步预期。
+- **采样方法**：每个测试用例跑 ≥5 次，附带上下文 token 统计，分析上下文长度与延迟的关系，为后续优化（如缓存、裁剪）提供依据。
+
 ---
 
 ## 5. 实验实施计划
@@ -659,6 +707,8 @@ class BM25:
 ### 6.2 混合检索主函数
 
 ```python
+import time
+
 def hybrid_search(
     query: str,
     bm25_index: BM25,
@@ -677,27 +727,41 @@ def hybrid_search(
         - debug_info: 调试信息（BM25/Dense/RRF 各阶段结果）
     """
 
+    latency = {}
+
     # 步骤 1：BM25 稀疏检索
+    t0 = time.perf_counter()
     bm25_results = bm25_index.search(query, top_k=bm25_top_k)
+    latency["bm25_ms"] = (time.perf_counter() - t0) * 1000
     bm25_doc_ids = [idx for idx, score in bm25_results]
 
     # 步骤 2：Dense 向量检索
-    dense_results = vector_index.search(query, top_k=dense_top_k)
+    t0 = time.perf_counter()
+    query_vector = embedding_service.embed(query)
+    dense_results = vector_index.search(query_vector, top_k=dense_top_k)
+    latency["dense_ms"] = (time.perf_counter() - t0) * 1000
     dense_doc_ids = [r['doc_id'] for r in dense_results]
 
     # 步骤 3：RRF 融合
+    t0 = time.perf_counter()
     rrf_results = rrf_fusion([bm25_doc_ids, dense_doc_ids], k=60)
+    latency["rrf_ms"] = (time.perf_counter() - t0) * 1000
 
     # 步骤 4：取 Top-40 候选文档
+    t0 = time.perf_counter()
     candidate_doc_ids = [doc_id for doc_id, score in rrf_results[:40]]
     candidate_docs = [vector_index.get_document(doc_id) for doc_id in candidate_doc_ids]
+    latency["candidate_fetch_ms"] = (time.perf_counter() - t0) * 1000
 
     # 步骤 5：Reranking 精排
+    t0 = time.perf_counter()
     final_results = reranking_service.rerank(
         query=query,
         documents=candidate_docs,
         top_k=final_top_k
     )
+    latency["rerank_ms"] = (time.perf_counter() - t0) * 1000
+    latency["retrieval_total_ms"] = sum(latency.values())
 
     # 调试信息
     debug_info = {
@@ -705,7 +769,8 @@ def hybrid_search(
         "dense_results": dense_doc_ids[:5],
         "rrf_fused": candidate_doc_ids[:10],
         "final_reranked": [r['doc_id'] for r in final_results],
-        "overlap_bm25_dense": len(set(bm25_doc_ids) & set(dense_doc_ids))
+        "overlap_bm25_dense": len(set(bm25_doc_ids) & set(dense_doc_ids)),
+        "latency": latency
     }
 
     return final_results, debug_info
@@ -723,6 +788,8 @@ def hybrid_search(
 ### 7.2 实验结果
 - `outputs/experiment2_results_YYYYMMDD_HHMMSS.json`
 - `outputs/experiment2_hybrid_rag_analysis.md`
+- `outputs/experiment2_latency_breakdown.json`（分阶段耗时）
+- `outputs/experiment2_latency_viz.png`（可视化图表）
 
 ### 7.3 关键发现（预期）
 - 混合检索相比纯向量检索，召回率提升 XX%
