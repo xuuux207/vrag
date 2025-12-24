@@ -30,6 +30,7 @@ from rag_utils import EmbeddingService, VectorIndex
 from data.fictional_knowledge_base import FICTIONAL_DOCUMENTS
 from data.company_graph import convert_all_companies_to_documents
 from experiments.incremental_summarizer_v2 import SimpleSummarizer
+from experiments.incremental_summarizer_v3 import IncrementalRAGSummarizer
 
 load_dotenv()
 
@@ -458,6 +459,106 @@ def method3_incremental_summary(
     }
 
 
+# ========== 方法4：渐进式总结+增量RAG（v3） ==========
+
+def method4_incremental_rag(
+    segments: List[Dict],
+    vector_index: VectorIndex,
+    embedding_service: EmbeddingService,
+    llm_client: OpenAI,
+    ground_truth: Dict,
+    top_k: int = 5
+) -> Dict:
+    """方法4：边输入边总结+边检索，过滤低相关度文档（v3版本）"""
+    # 1. 渐进式总结+RAG（包含模拟延迟）
+    summarizer = IncrementalRAGSummarizer(
+        llm_client,
+        embedding_service,
+        vector_index,
+        model_name=SUMMARY_MODEL,
+        relevance_threshold=0.6
+    )
+    segment_results = []
+
+    summary_start_time = time.time()
+    for segment_data in segments:
+        seg_result = summarizer.add_segment(segment_data["text"], simulate_delay=True)
+        segment_results.append(seg_result)
+
+    # 用户输入完成时刻（包含说话时间）
+    input_complete_time = time.time()
+
+    summary = summarizer.get_final_summary()
+    stats = summarizer.get_stats()
+
+    # 获取累积的相关文档（已经去重和过滤）
+    relevant_docs = summarizer.get_relevant_docs()
+
+    # 2. 生成回复（使用累积的相关文档）
+    rag_context = ""
+    for i, doc in enumerate(relevant_docs[:top_k], 1):
+        rag_context += f"\n[文档{i}] {doc.get('title', '无标题')}\n"
+        rag_context += f"{doc.get('content', '无内容')[:500]}\n"
+
+    full_text = "".join([seg["text"] for seg in segments])
+
+    prompt = f"""用户进行了{len(segments)}段语音输入。
+
+总结：
+{summary}
+
+相关信息：
+{rag_context}
+
+请给出专业、准确的回复：
+"""
+
+    gen_start = time.time()
+    final_response, ttft, gen_time, token_count = generate_response_streaming(prompt, llm_client)
+
+    # 3. LLM评估
+    eval_result = llm_evaluate_all(
+        "incremental_rag_v3",
+        full_text,
+        summary,
+        relevant_docs[:top_k],
+        final_response,
+        ground_truth,
+        llm_client
+    )
+
+    # 注意：total_time从输入完成开始计算
+    total_time_after_input = time.time() - input_complete_time
+
+    return {
+        "method": "incremental_rag_v3",
+        "summary": summary,
+        "rag_results": relevant_docs[:top_k],
+        "final_response": final_response,
+        "segment_results": segment_results,
+        "timing": {
+            "summary_time_with_speech": time.time() - summary_start_time,  # 包含说话时间
+            "summary_processing_time": stats["total_processing_time"],  # 纯处理时间
+            "rag_time": stats["total_rag_time"],  # 累积RAG时间
+            "avg_rag_time": stats["avg_rag_time"],  # 平均每段RAG时间
+            "ttft": ttft,
+            "generation_time": gen_time,
+            "total_time_after_input": total_time_after_input,  # 输入完成后的等待时间
+        },
+        "metrics": {
+            "query_length": len(summary),
+            "compression_ratio": stats["compression_ratio"],
+            "response_length": len(final_response),
+            "token_count": token_count,
+            "tokens_per_second": token_count / gen_time if gen_time > 0 else 0,
+            "avg_segment_processing": stats["avg_segment_time"],
+            "total_retrieved_docs": stats["total_retrieved_docs"],
+            "total_relevant_docs": stats["total_relevant_docs"]
+        },
+        "evaluation": eval_result
+    }
+
+
 # ========== 主实验类 ==========
 
 class Experiment3V3Runner:
@@ -489,7 +590,7 @@ class Experiment3V3Runner:
         print(f"知识库文档数: {len(all_docs)}")
 
     def run_single_test(self, test_case: Dict) -> Dict:
-        """运行单个测试用例 - 并行执行三个方法"""
+        """运行单个测试用例 - 并行执行四个方法"""
         print(f"\n{'='*70}")
         print(f"测试用例: {test_case['id']}")
         print(f"类别: {test_case['category']}")
@@ -507,12 +608,12 @@ class Experiment3V3Runner:
             "ground_truth": test_case["ground_truth"]
         }
 
-        print("🚀 并行运行三个方法...")
+        print("🚀 并行运行四个方法...")
         start_parallel = time.time()
 
-        # 使用线程池并行运行三个方法
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            # 提交三个任务
+        # 使用线程池并行运行四个方法
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            # 提交四个任务
             future_m1 = executor.submit(
                 method1_baseline,
                 full_text,
@@ -540,11 +641,21 @@ class Experiment3V3Runner:
                 test_case["ground_truth"]
             )
 
+            future_m4 = executor.submit(
+                method4_incremental_rag,
+                test_case["segments"],
+                self.vector_index,
+                self.embedding_service,
+                self.llm_client,
+                test_case["ground_truth"]
+            )
+
             # 收集结果
             futures = {
                 "method1": future_m1,
                 "method2": future_m2,
-                "method3": future_m3
+                "method3": future_m3,
+                "method4": future_m4
             }
 
             for method_name, future in futures.items():
@@ -556,9 +667,12 @@ class Experiment3V3Runner:
                     elif method_name == "method2":
                         result["method2_batch"] = result_data
                         print(f"  ✓ 方法2完成（{result_data['timing']['total_time']:.2f}秒）")
-                    else:
+                    elif method_name == "method3":
                         result["method3_incremental"] = result_data
                         print(f"  ✓ 方法3完成（输入后: {result_data['timing']['total_time_after_input']:.2f}秒）")
+                    else:
+                        result["method4_incremental_rag"] = result_data
+                        print(f"  ✓ 方法4完成（输入后: {result_data['timing']['total_time_after_input']:.2f}秒, 检索{result_data['metrics']['total_relevant_docs']}个文档）")
                 except Exception as e:
                     print(f"  ✗ {method_name}失败: {e}")
                     import traceback
@@ -575,7 +689,12 @@ class Experiment3V3Runner:
         results = []
 
         print(f"\n开始运行 {len(test_cases)} 个测试用例...")
-        print(f"配置：总结模型={SUMMARY_MODEL}, 回复模型={RESPONSE_MODEL}\n")
+        print(f"配置：总结模型={SUMMARY_MODEL}, 回复模型={RESPONSE_MODEL}")
+        print(f"方法对比：")
+        print(f"  1. Baseline - 直接RAG (800字原文)")
+        print(f"  2. Batch Summary - 等输入完成后总结+RAG")
+        print(f"  3. Incremental v2 - 边输入边总结，最后RAG")
+        print(f"  4. Incremental v3 (新) - 边输入边总结+增量RAG，相关度过滤\n")
 
         for i, test_case in enumerate(test_cases, 1):
             print(f"\n[{i}/{len(test_cases)}]")
