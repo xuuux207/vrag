@@ -14,7 +14,9 @@ def load_latest_v3_results() -> List[Dict]:
     """加载最新的v3实验结果"""
     output_dir = Path(__file__).parent.parent / "outputs"
 
-    result_files = list(output_dir.glob("experiment3_v3_results_*.json"))
+    # Try patterns: v3_server, v3_dual_model, or v3 general
+    result_files = list(output_dir.glob("experiment3_v3_*results_*.json")) + \
+                   list(output_dir.glob("experiment3_dual_model_results_*.json"))
     if not result_files:
         print("❌ 未找到v3实验结果文件")
         sys.exit(1)

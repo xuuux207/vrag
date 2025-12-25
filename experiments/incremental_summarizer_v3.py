@@ -174,7 +174,9 @@ class IncrementalRAGSummarizer:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 stream=False,
-                extra_body={"enable_thinking": False}
+                extra_body={
+                    "chat_template_kwargs": {"enable_thinking": False}
+                }
             )
 
             self.current_summary = response.choices[0].message.content.strip()
