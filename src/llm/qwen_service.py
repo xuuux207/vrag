@@ -4,9 +4,8 @@ Qwen LLM 服务
 """
 
 import logging
-import json
 from typing import List, Dict, Iterator, Optional
-import requests
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +31,13 @@ class QwenService:
         """
         self.api_base = api_base.rstrip("/")
         self.model = model
-        self.token = token
         self.temperature = temperature
+
+        # 初始化OpenAI客户端（兼容Qwen API）
+        self.client = OpenAI(
+            api_key=token,
+            base_url=api_base,
+        )
 
     def chat_stream(
         self,
@@ -58,59 +62,24 @@ class QwenService:
 
         full_messages.extend(messages)
 
-        # 构建请求
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
-
-        payload = {
-            "model": self.model,
-            "messages": full_messages,
-            "temperature": self.temperature,
-            "stream": True,
-        }
-
         try:
-            # 发送流式请求
-            url = f"{self.api_base}/chat/completions"
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
+            # 使用OpenAI SDK进行流式调用
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=full_messages,
+                temperature=self.temperature,
                 stream=True,
-                timeout=60,
+                extra_body={"enable_thinking": False},  # 关闭思考模式
             )
-            response.raise_for_status()
 
-            # 解析流式响应
-            for line in response.iter_lines():
-                if not line:
-                    continue
+            # 逐个返回chunk
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    logger.info(f"[流式] yield chunk: {repr(content)}")
+                    yield content
 
-                line = line.decode("utf-8")
-
-                # 跳过data:前缀
-                if line.startswith("data: "):
-                    line = line[6:]
-
-                # 结束标记
-                if line == "[DONE]":
-                    break
-
-                # 解析JSON
-                try:
-                    chunk = json.loads(line)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    content = delta.get("content")
-
-                    if content:
-                        yield content
-
-                except json.JSONDecodeError:
-                    continue
-
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             logger.error(f"Qwen API调用失败: {str(e)}")
             raise RuntimeError(f"LLM调用失败: {str(e)}")
 
@@ -137,34 +106,20 @@ class QwenService:
 
         full_messages.extend(messages)
 
-        # 构建请求
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
-
-        payload = {
-            "model": self.model,
-            "messages": full_messages,
-            "temperature": self.temperature,
-            "stream": False,
-        }
-
         try:
-            url = f"{self.api_base}/chat/completions"
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=60,
+            # 使用OpenAI SDK进行非流式调用
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=full_messages,
+                temperature=self.temperature,
+                stream=False,
+                extra_body={"enable_thinking": False},  # 关闭思考模式
             )
-            response.raise_for_status()
 
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            return content
+            content = response.choices[0].message.content
+            return content if content else ""
 
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             logger.error(f"Qwen API调用失败: {str(e)}")
             raise RuntimeError(f"LLM调用失败: {str(e)}")
 

@@ -143,6 +143,105 @@ class TTSService:
                 on_canceled(error_msg)
             raise
 
+    def synthesize_to_bytes(self, text: str) -> bytes:
+        """
+        合成语音并返回完整音频数据（不播放）
+
+        Args:
+            text: 要合成的文本
+
+        Returns:
+            音频数据（WAV格式）
+        """
+        try:
+            # 配置语音合成（无音频输出）
+            speech_config = speechsdk.SpeechConfig(
+                subscription=self.key, region=self.region
+            )
+
+            # 使用pull stream
+            pull_stream = speechsdk.audio.PullAudioOutputStream()
+            audio_config = speechsdk.audio.AudioOutputConfig(stream=pull_stream)
+
+            # 创建合成器
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=speech_config, audio_config=audio_config
+            )
+
+            # 构建SSML并合成
+            ssml = self._build_ssml(text)
+            result = synthesizer.speak_ssml_async(ssml).get()
+
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                # 直接返回音频数据
+                return result.audio_data
+            else:
+                error_msg = f"合成失败: {result.cancellation_details.reason}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+
+        except Exception as e:
+            logger.error(f"合成失败: {str(e)}")
+            raise
+
+    def play_audio_bytes(self, audio_data: bytes):
+        """
+        播放音频数据到默认扬声器
+
+        Args:
+            audio_data: 音频字节数据（WAV格式）
+        """
+        try:
+            # 配置语音合成（使用默认扬声器）
+            speech_config = speechsdk.SpeechConfig(
+                subscription=self.key, region=self.region
+            )
+            audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
+
+            # 创建合成器
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=speech_config, audio_config=audio_config
+            )
+
+            # 从音频数据创建音频流
+            audio_stream = speechsdk.audio.PushAudioInputStream()
+            audio_stream.write(audio_data)
+            audio_stream.close()
+
+            # 播放
+            audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
+            # 注意：Azure SDK没有直接播放bytes的API，需要用其他方式
+            # 这里用PyAudio作为替代
+            import wave
+            import io
+            import pyaudio
+
+            # 解析WAV数据
+            with io.BytesIO(audio_data) as wav_io:
+                with wave.open(wav_io, 'rb') as wf:
+                    p = pyaudio.PyAudio()
+                    stream = p.open(
+                        format=p.get_format_from_width(wf.getsampwidth()),
+                        channels=wf.getnchannels(),
+                        rate=wf.getframerate(),
+                        output=True
+                    )
+
+                    # 播放
+                    chunk_size = 1024
+                    data = wf.readframes(chunk_size)
+                    while data:
+                        stream.write(data)
+                        data = wf.readframes(chunk_size)
+
+                    stream.stop_stream()
+                    stream.close()
+                    p.terminate()
+
+        except Exception as e:
+            logger.error(f"播放失败: {str(e)}")
+            raise
+
     def synthesize_to_stream(self, text: str) -> Iterator[bytes]:
         """
         合成语音并返回音频流（用于自定义处理）
