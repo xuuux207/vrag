@@ -10,6 +10,7 @@ import uuid
 from typing import List, Dict, Optional, Callable
 from threading import Event, Thread, Lock, Condition
 from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
 
 from src.agents.rag_decision_agent import RAGDecisionAgent
 from src.agents.input_completion_agent import InputCompletionAgent
@@ -58,13 +59,11 @@ class VoiceAssistant:
         self.is_running = False
         self.is_processing = False
 
-        # 输入缓冲（用于处理输入不完整的情况）
+        # 输入缓冲（用于处理输入不完整的情况 - 防抖机制）
         self.input_buffer = ""  # 缓冲的用户输入
         self.input_buffer_lock = Lock()  # 保护input_buffer
         self.pending_input_event = Event()  # 等待新输入的事件
-        self.pending_input_timer: Optional[Thread] = None  # 等待计时器线程
-        self.max_input_wait_attempts = 3  # 最多等待3次
-        self.input_wait_timeout = 2.0  # 每次等待最多2秒
+        self.input_wait_timeout = 4.0  # 最多等待4秒
 
         # 打断控制
         self.interrupt_requested = False  # 打断请求标志
@@ -73,10 +72,17 @@ class VoiceAssistant:
 
         # TTS任务队列管理（使用session ID避免频繁启停线程）
         self.tts_queue = Queue()
-        self.tts_worker_thread: Optional[Thread] = None
+        self.tts_synthesis_thread: Optional[Thread] = None  # 合成调度线程
+        self.tts_playback_thread: Optional[Thread] = None  # 播放线程
         self.current_session_id = str(uuid.uuid4())  # 当前会话ID
         self.session_lock = Lock()  # 保护session_id
         self.is_tts_playing = False  # 当前是否正在播放
+
+        # TTS并行合成（加速语音生成）
+        self.tts_synthesis_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="TTS-Synthesis")
+        self.audio_buffer: Dict[tuple, bytes] = {}  # {(session_id, index): audio_data}
+        self.audio_buffer_lock = Lock()  # 保护audio_buffer
+        self.audio_ready_event = Condition()  # 通知播放线程有新音频ready
 
         # 临时变量（用于处理单轮对话）
         self._current_user_text = None
@@ -146,35 +152,36 @@ class VoiceAssistant:
         self._stop_tts_worker()
 
     def _start_tts_worker(self):
-        """启动持久TTS工作线程"""
-        if self.tts_worker_thread and self.tts_worker_thread.is_alive():
-            logger.debug("TTS worker已在运行")
+        """启动持久TTS工作线程（合成+播放）"""
+        if self.tts_synthesis_thread and self.tts_synthesis_thread.is_alive():
+            logger.debug("TTS synthesis thread已在运行")
+            return
+        if self.tts_playback_thread and self.tts_playback_thread.is_alive():
+            logger.debug("TTS playback thread已在运行")
             return
 
-        self.tts_worker_thread = Thread(target=self._tts_worker_loop, daemon=True)
-        self.tts_worker_thread.start()
-        logger.info("TTS worker线程已启动")
+        self.tts_synthesis_thread = Thread(target=self._tts_synthesis_loop, daemon=True)
+        self.tts_playback_thread = Thread(target=self._tts_playback_loop, daemon=True)
+        self.tts_synthesis_thread.start()
+        self.tts_playback_thread.start()
+        logger.info("TTS worker线程已启动（合成+播放）")
 
     def _stop_tts_worker(self):
         """停止TTS工作线程"""
-        if not self.tts_worker_thread:
-            return
-
         # 发送停止信号
         self.tts_queue.put(None)
         logger.info("TTS worker线程停止信号已发送")
 
-    def _tts_worker_loop(self):
+    def _tts_synthesis_loop(self):
         """
-        TTS工作线程主循环（持久运行）
+        TTS合成调度循环（持久运行）
 
-        使用session ID管理任务：
-        - 每个任务带有session_id
-        - 播放前检查session_id是否匹配当前session
-        - 打断时只需要更新session_id，无需重启线程
-        - 检查abort_event，打断时立即停止合成
+        职责：
+        - 从队列取任务
+        - 立即提交到线程池合成（不等待）
+        - 多个句子并行合成
         """
-        logger.info("TTS worker循环开始")
+        logger.info("TTS合成调度循环开始")
 
         while self.is_running:
             try:
@@ -183,58 +190,129 @@ class VoiceAssistant:
 
                 # None表示结束信号
                 if item is None:
-                    logger.debug("TTS worker收到停止信号")
+                    logger.debug("TTS合成线程收到停止信号")
                     break
 
                 session_id, index, sentence = item
 
-                # 检查session是否匹配（打断后session_id会变化）
+                # 检查session是否匹配
                 with self.session_lock:
                     if session_id != self.current_session_id:
-                        logger.debug(f"跳过旧session的任务 #{index} (session: {session_id[:8]})")
+                        logger.debug(f"跳过旧session的合成任务 #{index}")
                         continue
 
                 # 检查中断信号
                 if self.abort_event.is_set():
-                    logger.debug(f"检测到中断信号，跳过TTS任务 #{index}")
+                    logger.debug(f"检测到中断信号，跳过合成 #{index}")
                     continue
 
-                # 合成并播放
-                try:
-                    logger.debug(f"TTS合成 #{index}: {sentence[:30]}...")
-                    audio_data = self.tts.synthesize_to_bytes(sentence)
-                    logger.debug(f"TTS合成完成 #{index}, 大小: {len(audio_data)} bytes")
-
-                    # 再次检查session（合成可能耗时较长）
-                    with self.session_lock:
-                        if session_id != self.current_session_id:
-                            logger.debug(f"合成完成后session已变化，跳过播放 #{index}")
-                            continue
-
-                    # 再次检查中断信号
-                    if self.abort_event.is_set():
-                        logger.debug(f"合成完成后检测到中断信号，跳过播放 #{index}")
-                        continue
-
-                    # 播放
-                    self.is_tts_playing = True
-                    logger.debug(f"TTS播放 #{index}: {sentence[:30]}...")
-                    self.tts.reset_playback_flag()
-                    self.tts.play_audio_bytes(audio_data)
-                    logger.debug(f"TTS播放完成 #{index}")
-
-                except Exception as e:
-                    logger.error(f"TTS #{index} 失败: {str(e)}")
+                # 提交到线程池异步合成
+                buffer_key = (session_id, index)
+                with self.audio_buffer_lock:
+                    if buffer_key not in self.audio_buffer:
+                        logger.debug(f"提交合成任务 #{index}: {sentence[:30]}...")
+                        self.tts_synthesis_executor.submit(
+                            self._synthesize_sentence, session_id, index, sentence
+                        )
 
             except Empty:
-                # 队列空，继续等待
-                self.is_tts_playing = False
                 continue
             except Exception as e:
-                logger.error(f"TTS worker错误: {str(e)}")
+                logger.error(f"TTS合成调度错误: {str(e)}")
+
+        logger.info("TTS合成调度循环结束")
+
+    def _tts_playback_loop(self):
+        """
+        TTS播放循环（持久运行）
+
+        职责：
+        - 按序号等待buffer中的音频
+        - 顺序播放
+        """
+        logger.info("TTS播放循环开始")
+
+        current_session = None
+        next_play_index = 0
+
+        while self.is_running:
+            try:
+                # 获取当前session
+                with self.session_lock:
+                    session_id = self.current_session_id
+
+                # 检测到新session，重置
+                if current_session != session_id:
+                    current_session = session_id
+                    next_play_index = 0
+                    logger.debug(f"切换到新session: {session_id[:8]}")
+
+                # 等待下一个要播放的音频
+                buffer_key = (session_id, next_play_index)
+                audio_data = None
+
+                # 等待音频ready（最多1秒）
+                for _ in range(20):  # 20 * 0.05 = 1秒
+                    with self.audio_buffer_lock:
+                        if buffer_key in self.audio_buffer:
+                            audio_data = self.audio_buffer.pop(buffer_key)
+                            break
+                    time.sleep(0.05)
+
+                if audio_data is None:
+                    # 1秒内没有音频，可能已经播放完毕
+                    self.is_tts_playing = False
+                    time.sleep(0.1)
+                    continue
+
+                # 检查session和中断信号
+                with self.session_lock:
+                    if session_id != self.current_session_id:
+                        logger.debug(f"session已变化，跳过播放 #{next_play_index}")
+                        continue
+
+                if self.abort_event.is_set():
+                    logger.debug(f"检测到中断信号，跳过播放 #{next_play_index}")
+                    continue
+
+                # 播放
+                try:
+                    self.is_tts_playing = True
+                    logger.debug(f"TTS播放 #{next_play_index}")
+                    self.tts.reset_playback_flag()
+                    self.tts.play_audio_bytes(audio_data)
+                    logger.debug(f"TTS播放完成 #{next_play_index}")
+                    next_play_index += 1
+                except Exception as e:
+                    logger.error(f"TTS播放 #{next_play_index} 失败: {str(e)}")
+                    next_play_index += 1
+
+            except Exception as e:
+                logger.error(f"TTS播放循环错误: {str(e)}")
 
         self.is_tts_playing = False
-        logger.info("TTS worker循环结束")
+        logger.info("TTS播放循环结束")
+
+    def _synthesize_sentence(self, session_id: str, index: int, sentence: str) -> None:
+        """
+        合成单个句子（在线程池中运行）
+
+        Args:
+            session_id: 会话ID
+            index: 句子序号
+            sentence: 句子文本
+        """
+        try:
+            logger.debug(f"合成中 #{index}: {sentence[:30]}...")
+            audio_data = self.tts.synthesize_to_bytes(sentence)
+            logger.debug(f"合成完成 #{index}, 大小: {len(audio_data)} bytes")
+
+            # 存入buffer
+            with self.audio_buffer_lock:
+                self.audio_buffer[(session_id, index)] = audio_data
+
+        except Exception as e:
+            logger.error(f"TTS合成 #{index} 失败: {str(e)}")
 
     def _on_stt_recognizing(self, text: str):
         """STT部分识别结果"""
@@ -284,14 +362,13 @@ class VoiceAssistant:
 
     def _handle_user_input_with_completion_check(self, text: str):
         """
-        处理用户输入（带完整性判断和等待）
+        处理用户输入（带完整性判断和等待 - 防抖机制）
 
         逻辑：
         1. 判断输入是否完整
-        2. 如果不完整，等待新输入（最多2秒）
+        2. 如果不完整，等待新输入（最多4秒）
         3. 有新输入立即合并并重新判断
-        4. 最多重试3次
-        5. 然后启动正常处理流程
+        4. 4秒后无新输入则直接处理
         """
         # 如果正在处理中，说明是打断，不需要完整性判断
         if self.is_processing:
@@ -317,49 +394,43 @@ class VoiceAssistant:
 
     def _check_input_completion_and_process(self):
         """
-        检查输入完整性并处理（带重试）
+        检查输入完整性并处理（防抖机制）
 
         在独立线程中运行，负责判断输入完整性，并等待可能的补充输入
         """
-        attempt = 0
+        with self.input_buffer_lock:
+            current_input = self.input_buffer
+            logger.info(f"[完整性判断] 当前输入: {current_input[:50]}")
 
-        while attempt < self.max_input_wait_attempts:
-            attempt += 1
+        # 判断是否完整
+        is_complete = self.input_completion_agent.is_input_complete(
+            current_input,
+            self.messages[-4:] if self.messages else []
+        )
 
+        if is_complete:
+            # 输入完整，启动处理
+            logger.info(f"✓ 输入完整，启动处理")
+            self._start_processing(current_input)
+            return
+
+        # 输入不完整，等待新输入
+        logger.info(f"✗ 输入不完整，等待{self.input_wait_timeout}秒（或新输入）...")
+        self.pending_input_event.clear()
+
+        # 等待新输入或超时
+        has_new_input = self.pending_input_event.wait(timeout=self.input_wait_timeout)
+
+        if has_new_input:
+            logger.info("收到新输入，重新判断")
+            # 重新进入判断流程
+            self._check_input_completion_and_process()
+        else:
+            # 超时，直接处理当前输入
             with self.input_buffer_lock:
-                current_input = self.input_buffer
-                logger.info(f"[完整性判断 {attempt}/{self.max_input_wait_attempts}] 当前输入: {current_input[:50]}")
-
-            # 判断是否完整
-            is_complete = self.input_completion_agent.is_input_complete(
-                current_input,
-                self.messages[-4:] if self.messages else []
-            )
-
-            if is_complete:
-                # 输入完整，启动处理
-                logger.info(f"✓ 输入完整，启动处理")
-                self._start_processing(current_input)
-                return
-
-            # 输入不完整，等待新输入
-            if attempt < self.max_input_wait_attempts:
-                logger.info(f"✗ 输入不完整，等待{self.input_wait_timeout}秒（或新输入）...")
-                self.pending_input_event.clear()
-                # 等待新输入或超时
-                has_new_input = self.pending_input_event.wait(timeout=self.input_wait_timeout)
-
-                if has_new_input:
-                    logger.info("收到新输入，重新判断")
-                    continue
-                else:
-                    logger.info("等待超时，继续判断")
-                    continue
-            else:
-                # 达到最大重试次数，强制处理
-                logger.info(f"✗ 达到最大重试次数，强制处理: {current_input[:50]}")
-                self._start_processing(current_input)
-                return
+                final_input = self.input_buffer
+            logger.info(f"等待超时，直接处理: {final_input[:50]}")
+            self._start_processing(final_input)
 
     def _start_processing(self, user_text: str):
         """启动用户输入处理流程"""
@@ -667,7 +738,15 @@ class VoiceAssistant:
         if cleared_count > 0:
             logger.debug(f"已清空队列中的 {cleared_count} 个旧任务")
 
-        # 5. 保存被打断的不完整回复
+        # 5. 清空音频缓冲区中的旧音频
+        with self.audio_buffer_lock:
+            keys_to_remove = [k for k in self.audio_buffer.keys() if k[0] == old_session_id]
+            for key in keys_to_remove:
+                self.audio_buffer.pop(key, None)
+            if len(keys_to_remove) > 0:
+                logger.debug(f"已清空buffer中的 {len(keys_to_remove)} 个旧音频")
+
+        # 6. 保存被打断的不完整回复
         if self._current_assistant_text:
             interrupted_text = self._current_assistant_text + " [被打断]"
             self.interrupted_response = interrupted_text
@@ -677,10 +756,10 @@ class VoiceAssistant:
             self.messages.append({"role": "assistant", "content": interrupted_text})
             logger.info(f"已保存被打断的回复到上下文: {interrupted_text[:50]}...")
 
-        # 6. 设置打断标志
+        # 7. 设置打断标志
         self.interrupt_requested = True
 
-        # 7. 重置处理状态
+        # 8. 重置处理状态
         self.is_processing = False
         self.is_tts_playing = False
 
