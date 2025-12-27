@@ -27,7 +27,7 @@ class STTSileroService:
         vad_threshold: float = 0.5,
         model_path: str = None,
         min_speech_duration: float = 0.3,
-        min_silence_duration: float = 2.0,
+        min_silence_duration: float = 1.0,
     ):
         """
         初始化STT服务
@@ -40,7 +40,7 @@ class STTSileroService:
             vad_threshold: VAD阈值（0-1，默认0.5）
             model_path: 保留参数，兼容性用（官方库自动下载模型）
             min_speech_duration: 最小语音时长（秒，默认0.3）
-            min_silence_duration: 最小静音时长（秒，默认2.0，停顿多久算结束）
+            min_silence_duration: 最小静音时长（秒，默认1.0，停顿多久算结束）
         """
         self.key = key
         self.region = region
@@ -86,6 +86,7 @@ class STTSileroService:
         self.on_session_started = None
         self.on_session_stopped = None
         self.on_canceled = None
+        self.on_speech_started = None  # VAD检测到语音开始的回调（用于打断检测）
 
     def _init_silero_vad(self):
         """初始化Silero VAD（官方库）"""
@@ -104,6 +105,7 @@ class STTSileroService:
         on_session_started: Optional[Callable[[], None]] = None,
         on_session_stopped: Optional[Callable[[], None]] = None,
         on_canceled: Optional[Callable[[str], None]] = None,
+        on_speech_started: Optional[Callable[[], None]] = None,
     ):
         """
         启动连续识别（Silero VAD + Azure STT）
@@ -114,6 +116,7 @@ class STTSileroService:
             on_session_started: 会话开始回调
             on_session_stopped: 会话停止回调
             on_canceled: 取消/错误回调
+            on_speech_started: VAD检测到语音开始回调（用于打断检测）
         """
         if self._is_recognizing:
             logger.warning("识别已在运行中")
@@ -124,6 +127,7 @@ class STTSileroService:
         self.on_session_started = on_session_started
         self.on_session_stopped = on_session_stopped
         self.on_canceled = on_canceled
+        self.on_speech_started = on_speech_started
 
         try:
             # 配置Azure Speech
@@ -212,6 +216,9 @@ class STTSileroService:
                     if not self.is_speech and self.speech_counter >= self.min_speech_frames:
                         self.is_speech = True
                         logger.info(f"[VAD] 语音开始 (prob={speech_prob:.4f}, counter={self.speech_counter})")
+                        # 触发语音开始回调（用于打断检测）
+                        if self.on_speech_started:
+                            self.on_speech_started()
                 else:
                     # 静音
                     self.silence_counter += 1

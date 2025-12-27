@@ -36,6 +36,11 @@ class TTSService:
         self.synthesizer = None
         self._is_synthesizing = False
 
+        # 播放控制
+        self._playback_stream = None
+        self._playback_audio = None
+        self._stop_playback = False
+
     def _build_ssml(self, text: str) -> str:
         """
         构建SSML（用于语速控制）
@@ -186,32 +191,12 @@ class TTSService:
 
     def play_audio_bytes(self, audio_data: bytes):
         """
-        播放音频数据到默认扬声器
+        播放音频数据到默认扬声器（支持打断）
 
         Args:
             audio_data: 音频字节数据（WAV格式）
         """
         try:
-            # 配置语音合成（使用默认扬声器）
-            speech_config = speechsdk.SpeechConfig(
-                subscription=self.key, region=self.region
-            )
-            audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
-
-            # 创建合成器
-            synthesizer = speechsdk.SpeechSynthesizer(
-                speech_config=speech_config, audio_config=audio_config
-            )
-
-            # 从音频数据创建音频流
-            audio_stream = speechsdk.audio.PushAudioInputStream()
-            audio_stream.write(audio_data)
-            audio_stream.close()
-
-            # 播放
-            audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
-            # 注意：Azure SDK没有直接播放bytes的API，需要用其他方式
-            # 这里用PyAudio作为替代
             import wave
             import io
             import pyaudio
@@ -219,27 +204,44 @@ class TTSService:
             # 解析WAV数据
             with io.BytesIO(audio_data) as wav_io:
                 with wave.open(wav_io, 'rb') as wf:
-                    p = pyaudio.PyAudio()
-                    stream = p.open(
-                        format=p.get_format_from_width(wf.getsampwidth()),
+                    self._playback_audio = pyaudio.PyAudio()
+                    self._playback_stream = self._playback_audio.open(
+                        format=self._playback_audio.get_format_from_width(wf.getsampwidth()),
                         channels=wf.getnchannels(),
                         rate=wf.getframerate(),
                         output=True
                     )
 
-                    # 播放
+                    # 播放（支持打断）
                     chunk_size = 1024
                     data = wf.readframes(chunk_size)
-                    while data:
-                        stream.write(data)
+                    while data and not self._stop_playback:
+                        self._playback_stream.write(data)
                         data = wf.readframes(chunk_size)
 
-                    stream.stop_stream()
-                    stream.close()
-                    p.terminate()
+                    # 清理
+                    self._playback_stream.stop_stream()
+                    self._playback_stream.close()
+                    self._playback_audio.terminate()
+                    self._playback_stream = None
+                    self._playback_audio = None
 
         except Exception as e:
             logger.error(f"播放失败: {str(e)}")
+            # 确保清理资源
+            if self._playback_stream:
+                try:
+                    self._playback_stream.stop_stream()
+                    self._playback_stream.close()
+                except:
+                    pass
+            if self._playback_audio:
+                try:
+                    self._playback_audio.terminate()
+                except:
+                    pass
+            self._playback_stream = None
+            self._playback_audio = None
             raise
 
     def synthesize_to_stream(self, text: str) -> Iterator[bytes]:
@@ -298,3 +300,12 @@ class TTSService:
                 logger.info("已停止语音合成")
             except Exception as e:
                 logger.error(f"停止合成失败: {str(e)}")
+
+    def stop_playback(self):
+        """立即停止播放（用于打断）"""
+        self._stop_playback = True
+        logger.info("已请求停止播放")
+
+    def reset_playback_flag(self):
+        """重置播放标志（用于新的播放会话）"""
+        self._stop_playback = False

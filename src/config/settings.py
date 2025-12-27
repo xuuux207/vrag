@@ -29,7 +29,7 @@ class VADConfig:
     sample_rate: int = 16000  # Silero VAD采样率
     threshold: float = 0.5  # Silero VAD阈值
     min_speech_duration: float = 0.3  # 最小语音时长（秒）
-    min_silence_duration: float = 2.0  # 最小静音时长（秒，停顿多久算结束）
+    min_silence_duration: float = 1.0  # 最小静音时长（秒，停顿多久算结束）
 
 
 @dataclass
@@ -98,7 +98,7 @@ class Settings:
             type=os.getenv("VAD_TYPE", "azure").lower(),
             threshold=float(os.getenv("VAD_THRESHOLD", "0.5")),
             min_speech_duration=float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.3")),
-            min_silence_duration=float(os.getenv("VAD_MIN_SILENCE_DURATION", "2.0")),
+            min_silence_duration=float(os.getenv("VAD_MIN_SILENCE_DURATION", "1.0")),
         )
 
         # Azure AI Search（支持旧键名AI_SEARCH_*）

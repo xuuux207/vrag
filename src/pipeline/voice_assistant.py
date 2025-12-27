@@ -6,6 +6,7 @@
 import logging
 import re
 import time
+import uuid
 from typing import List, Dict, Optional, Callable
 from threading import Event, Thread, Lock, Condition
 from queue import Queue, Empty
@@ -49,14 +50,17 @@ class VoiceAssistant:
         self.is_running = False
         self.is_processing = False
 
-        # TTS流式播放队列
+        # 打断控制
+        self.interrupt_requested = False  # 打断请求标志
+        self.interrupted_response = None  # 被打断的不完整回复
+        self.abort_event = Event()  # 中断信号：用于立即停止LLM生成和TTS合成
+
+        # TTS任务队列管理（使用session ID避免频繁启停线程）
         self.tts_queue = Queue()
         self.tts_worker_thread: Optional[Thread] = None
-        self.is_tts_playing = False
-        self.next_play_index = 0  # 下一个要播放的句子序号
-        self.play_condition = Condition()  # 顺序播放条件变量
-        self.active_tts_count = 0  # 正在播放的TTS任务数
-        self.active_tts_lock = Lock()  # 保护计数器
+        self.current_session_id = str(uuid.uuid4())  # 当前会话ID
+        self.session_lock = Lock()  # 保护session_id
+        self.is_tts_playing = False  # 当前是否正在播放
 
         # 临时变量（用于处理单轮对话）
         self._current_user_text = None
@@ -89,6 +93,9 @@ class VoiceAssistant:
         logger.info("启动语音助手...")
         self.is_running = True
 
+        # 启动持久TTS worker线程
+        self._start_tts_worker()
+
         # 启动STT连续识别
         try:
             self.stt.start_continuous_recognition(
@@ -97,6 +104,7 @@ class VoiceAssistant:
                 on_session_started=self._on_stt_session_started,
                 on_session_stopped=self._on_stt_session_stopped,
                 on_canceled=self._on_stt_canceled,
+                on_speech_started=self._on_speech_started,  # VAD检测到语音开始
             )
         except Exception as e:
             logger.error(f"启动STT失败: {str(e)}")
@@ -122,124 +130,110 @@ class VoiceAssistant:
         self._stop_tts_worker()
 
     def _start_tts_worker(self):
-        """启动TTS工作线程"""
+        """启动持久TTS工作线程"""
         if self.tts_worker_thread and self.tts_worker_thread.is_alive():
+            logger.debug("TTS worker已在运行")
             return
 
-        self.is_tts_playing = True
         self.tts_worker_thread = Thread(target=self._tts_worker_loop, daemon=True)
         self.tts_worker_thread.start()
-        logger.debug("TTS worker线程已启动")
+        logger.info("TTS worker线程已启动")
 
     def _stop_tts_worker(self):
         """停止TTS工作线程"""
         if not self.tts_worker_thread:
             return
 
-        self.is_tts_playing = False
-        # 清空队列
-        while not self.tts_queue.empty():
-            try:
-                self.tts_queue.get_nowait()
-            except Empty:
-                break
-
         # 发送停止信号
         self.tts_queue.put(None)
-        logger.debug("TTS worker线程已停止")
+        logger.info("TTS worker线程停止信号已发送")
 
     def _tts_worker_loop(self):
-        """TTS工作线程主循环"""
-        while self.is_tts_playing:
+        """
+        TTS工作线程主循环（持久运行）
+
+        使用session ID管理任务：
+        - 每个任务带有session_id
+        - 播放前检查session_id是否匹配当前session
+        - 打断时只需要更新session_id，无需重启线程
+        - 检查abort_event，打断时立即停止合成
+        """
+        logger.info("TTS worker循环开始")
+
+        while self.is_running:
             try:
-                # 从队列获取(index, sentence)
+                # 从队列获取 (session_id, index, sentence)
                 item = self.tts_queue.get(timeout=0.5)
 
                 # None表示结束信号
                 if item is None:
-                    logger.debug("TTS队列结束")
+                    logger.debug("TTS worker收到停止信号")
                     break
 
-                index, sentence = item
+                session_id, index, sentence = item
 
-                # 增加活动任务计数
-                with self.active_tts_lock:
-                    self.active_tts_count += 1
+                # 检查session是否匹配（打断后session_id会变化）
+                with self.session_lock:
+                    if session_id != self.current_session_id:
+                        logger.debug(f"跳过旧session的任务 #{index} (session: {session_id[:8]})")
+                        continue
 
-                # 在独立线程中合成并播放（合成并行，播放串行）
-                logger.debug(f"TTS启动 #{index}: {sentence[:50]}... (活动任务: {self.active_tts_count})")
-                Thread(
-                    target=self._synthesize_and_play_ordered,
-                    args=(index, sentence),
-                    daemon=True
-                ).start()
+                # 检查中断信号
+                if self.abort_event.is_set():
+                    logger.debug(f"检测到中断信号，跳过TTS任务 #{index}")
+                    continue
+
+                # 合成并播放
+                try:
+                    logger.debug(f"TTS合成 #{index}: {sentence[:30]}...")
+                    audio_data = self.tts.synthesize_to_bytes(sentence)
+                    logger.debug(f"TTS合成完成 #{index}, 大小: {len(audio_data)} bytes")
+
+                    # 再次检查session（合成可能耗时较长）
+                    with self.session_lock:
+                        if session_id != self.current_session_id:
+                            logger.debug(f"合成完成后session已变化，跳过播放 #{index}")
+                            continue
+
+                    # 再次检查中断信号
+                    if self.abort_event.is_set():
+                        logger.debug(f"合成完成后检测到中断信号，跳过播放 #{index}")
+                        continue
+
+                    # 播放
+                    self.is_tts_playing = True
+                    logger.debug(f"TTS播放 #{index}: {sentence[:30]}...")
+                    self.tts.reset_playback_flag()
+                    self.tts.play_audio_bytes(audio_data)
+                    logger.debug(f"TTS播放完成 #{index}")
+
+                except Exception as e:
+                    logger.error(f"TTS #{index} 失败: {str(e)}")
 
             except Empty:
+                # 队列空，继续等待
+                self.is_tts_playing = False
                 continue
             except Exception as e:
                 logger.error(f"TTS worker错误: {str(e)}")
 
-        # 等待所有TTS任务完成
-        logger.debug("等待所有TTS任务完成...")
-        while True:
-            with self.active_tts_lock:
-                if self.active_tts_count == 0:
-                    break
-            time.sleep(0.1)
-
-        # 额外等待音频缓冲区播放完毕（防止回音）
-        logger.debug("等待音频缓冲区清空...")
-        time.sleep(0.8)
-
-        # 重置标志
         self.is_tts_playing = False
-        logger.info("所有TTS播放完成，允许新的语音输入")
-
-    def _synthesize_and_play_ordered(self, index: int, sentence: str):
-        """按序合成并播放（合成并行，播放串行）"""
-        try:
-            # 1. 合成阶段（并行，无锁）
-            logger.debug(f"TTS合成 #{index}: {sentence[:30]}...")
-            audio_data = self.tts.synthesize_to_bytes(sentence)
-            logger.debug(f"TTS合成完成 #{index}, 音频大小: {len(audio_data)} bytes")
-
-            # 2. 等待轮到自己播放（按序）
-            with self.play_condition:
-                while self.next_play_index != index:
-                    logger.debug(f"TTS #{index} 等待播放 (当前: {self.next_play_index})")
-                    self.play_condition.wait()
-
-                # 3. 播放
-                logger.debug(f"TTS播放 #{index}: {sentence[:30]}...")
-                self.tts.play_audio_bytes(audio_data)
-                logger.debug(f"TTS播放完成 #{index}")
-
-                # 4. 通知下一个
-                self.next_play_index += 1
-                self.play_condition.notify_all()
-
-        except Exception as e:
-            logger.error(f"TTS #{index} 失败: {str(e)}")
-            # 即使失败也要推进序号，避免死锁
-            with self.play_condition:
-                if self.next_play_index == index:
-                    self.next_play_index += 1
-                    self.play_condition.notify_all()
-        finally:
-            # 减少活动任务计数
-            with self.active_tts_lock:
-                self.active_tts_count -= 1
-                logger.debug(f"TTS任务完成 #{index}，剩余活动任务: {self.active_tts_count}")
+        logger.info("TTS worker循环结束")
 
     def _on_stt_recognizing(self, text: str):
         """STT部分识别结果"""
         logger.debug(f"识别中: {text}")
 
+    def _on_speech_started(self):
+        """VAD检测到语音开始（用于快速打断）"""
+        # 如果正在播放TTS，立即打断（不等待STT识别完成）
+        if self.is_tts_playing:
+            logger.info(f"⚠️ VAD检测到语音开始，立即打断！")
+            self._handle_interruption()
+
     def _on_stt_recognized(self, text: str):
         """STT最终识别结果"""
-        # 阻止在处理期间或TTS播放期间的识别
-        if not self.is_running or self.is_processing or self.is_tts_playing:
-            logger.debug(f"忽略STT输入（正在处理或播放中）: {text}")
+        if not self.is_running:
             return
 
         logger.info(f"用户: {text}")
@@ -288,9 +282,20 @@ class VoiceAssistant:
         5. 更新历史
         6. 压缩上下文
         """
-        if self.is_processing:
+        if self.is_processing and not self.interrupt_requested:
             logger.warning("正在处理中，请稍候...")
             return
+
+        # 检查是否是打断后的新输入
+        was_interrupted = self.interrupt_requested
+        if was_interrupted:
+            logger.info(f"处理打断后的新输入: {user_text}")
+            self.interrupt_requested = False  # 重置打断标志
+            self._current_user_text = user_text  # 更新当前用户文本
+
+        # 清除中断信号（开始处理新任务）
+        self.abort_event.clear()
+        logger.debug("已清除中断信号，开始处理新任务")
 
         self.is_processing = True
         self._current_assistant_text = ""
@@ -298,7 +303,10 @@ class VoiceAssistant:
         try:
             # ===== 步骤1: RAG检索 =====
             logger.info("[1/5] RAG检索中...")
+            rag_start_time = time.time()
             rag_result = self.rag.search(user_text)
+            rag_elapsed = time.time() - rag_start_time
+            logger.info(f"[1/5] RAG检索完成，耗时: {rag_elapsed:.3f}秒")
 
             if self.on_rag_retrieved:
                 self.on_rag_retrieved(rag_result)
@@ -341,8 +349,15 @@ class VoiceAssistant:
 
             # ===== 步骤4: 更新对话历史 =====
             logger.info("[4/5] 更新对话历史...")
-            self.messages.append({"role": "user", "content": user_text})
-            self.messages.append({"role": "assistant", "content": assistant_text})
+            if not was_interrupted:
+                # 正常情况：添加用户输入和assistant回复
+                self.messages.append({"role": "user", "content": user_text})
+                self.messages.append({"role": "assistant", "content": assistant_text})
+            else:
+                # 打断后：只添加新的用户输入和assistant回复（被打断的回复已在_handle_interruption中保存）
+                self.messages.append({"role": "user", "content": user_text})
+                self.messages.append({"role": "assistant", "content": assistant_text})
+                logger.info(f"已添加打断后的新对话到历史")
 
             # ===== 步骤5: 异步压缩上下文（如果需要）=====
             if self.context_mgr.should_compress(self.messages):
@@ -393,11 +408,10 @@ class VoiceAssistant:
         # 添加到消息列表
         current_messages = messages + [{"role": "user", "content": enhanced_query}]
 
-        # 启动TTS worker
-        self._start_tts_worker()
+        # 获取当前session ID（用于任务标识）
+        with self.session_lock:
+            session_id = self.current_session_id
 
-        # 重置播放序号
-        self.next_play_index = 0
         sentence_index = 0
 
         # 流式生成 + 分句处理
@@ -407,6 +421,11 @@ class VoiceAssistant:
         for chunk in self.llm.chat_stream(
             current_messages, system_prompt=self.system_prompt
         ):
+            # 检查中断信号
+            if self.abort_event.is_set():
+                logger.info("检测到中断信号，停止LLM生成")
+                break
+
             logger.info(f"[LLM] chunk: {repr(chunk)}")
             full_response += chunk
             sentence_buffer += chunk
@@ -420,7 +439,7 @@ class VoiceAssistant:
                     if i + 1 < len(strong_parts):
                         sentence = strong_parts[i] + strong_parts[i+1]
                         if sentence.strip():
-                            self.tts_queue.put((sentence_index, sentence.strip()))
+                            self.tts_queue.put((session_id, sentence_index, sentence.strip()))
                             logger.info(f"[TTS入队-强分 #{sentence_index}] {sentence.strip()[:30]}...")
                             sentence_index += 1
 
@@ -436,7 +455,7 @@ class VoiceAssistant:
                         if i + 1 < len(weak_parts):
                             sentence = weak_parts[i] + weak_parts[i+1]
                             if sentence.strip():
-                                self.tts_queue.put((sentence_index, sentence.strip()))
+                                self.tts_queue.put((session_id, sentence_index, sentence.strip()))
                                 logger.info(f"[TTS入队-弱分 #{sentence_index}] {sentence.strip()[:30]}...")
                                 sentence_index += 1
 
@@ -444,18 +463,15 @@ class VoiceAssistant:
                     sentence_buffer = weak_parts[-1] if len(weak_parts) % 2 == 1 else ""
                 elif len(sentence_buffer) > 60:
                     # 既无分隔符又buffer过长，强制分句
-                    self.tts_queue.put((sentence_index, sentence_buffer.strip()))
+                    self.tts_queue.put((session_id, sentence_index, sentence_buffer.strip()))
                     logger.info(f"[TTS入队-强制 #{sentence_index}] {sentence_buffer.strip()[:30]}...")
                     sentence_index += 1
                     sentence_buffer = ""
 
-        # 处理剩余文本
-        if sentence_buffer.strip():
-            self.tts_queue.put((sentence_index, sentence_buffer.strip()))
+        # 处理剩余文本（如果未被中断）
+        if not self.abort_event.is_set() and sentence_buffer.strip():
+            self.tts_queue.put((session_id, sentence_index, sentence_buffer.strip()))
             logger.debug(f"TTS队列(剩余 #{sentence_index}): {sentence_buffer.strip()[:30]}...")
-
-        # 发送结束信号
-        self.tts_queue.put(None)
 
         logger.info(f"助手: {full_response}")
 
@@ -498,6 +514,61 @@ class VoiceAssistant:
     def get_conversation_history(self) -> List[Dict[str, str]]:
         """获取对话历史"""
         return self.messages.copy()
+
+    def _handle_interruption(self):
+        """
+        处理打断：更新session ID，停止当前播放
+
+        使用session ID + abort Event机制：
+        - 设置abort_event，立即中断LLM生成和TTS合成
+        - 更新session_id，后续任务会自动跳过旧session的内容
+        - 停止当前播放
+        - 清空队列中的旧任务（可选，因为worker会自动跳过）
+        """
+        logger.info("⚠️ 处理打断...")
+
+        # 1. 设置中断信号（立即停止LLM生成和TTS合成）
+        self.abort_event.set()
+        logger.debug("已设置中断信号")
+
+        # 2. 停止当前TTS播放
+        self.tts.stop_playback()
+
+        # 3. 更新session ID（这是关键：后续任务会跳过旧session）
+        with self.session_lock:
+            old_session_id = self.current_session_id
+            self.current_session_id = str(uuid.uuid4())
+            logger.debug(f"Session ID已更新: {old_session_id[:8]} -> {self.current_session_id[:8]}")
+
+        # 4. 清空队列中的旧任务（可选优化，避免worker处理无用任务）
+        cleared_count = 0
+        while not self.tts_queue.empty():
+            try:
+                self.tts_queue.get_nowait()
+                cleared_count += 1
+            except:
+                break
+        if cleared_count > 0:
+            logger.debug(f"已清空队列中的 {cleared_count} 个旧任务")
+
+        # 5. 保存被打断的不完整回复
+        if self._current_assistant_text:
+            interrupted_text = self._current_assistant_text + " [被打断]"
+            self.interrupted_response = interrupted_text
+
+            # 添加到对话历史
+            self.messages.append({"role": "user", "content": self._current_user_text})
+            self.messages.append({"role": "assistant", "content": interrupted_text})
+            logger.info(f"已保存被打断的回复到上下文: {interrupted_text[:50]}...")
+
+        # 6. 设置打断标志
+        self.interrupt_requested = True
+
+        # 7. 重置处理状态
+        self.is_processing = False
+        self.is_tts_playing = False
+
+        logger.info("✓ 打断处理完成")
 
     def clear_history(self):
         """清空对话历史"""
