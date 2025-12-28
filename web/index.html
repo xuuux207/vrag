@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TechFlow 语音客服</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 24px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 480px;
+            padding: 40px;
+            text-align: center;
+        }
+        h1 { font-size: 28px; color: #333; margin-bottom: 8px; }
+        .subtitle { font-size: 14px; color: #666; margin-bottom: 32px; }
+        .status { font-size: 16px; color: #666; margin-bottom: 24px; min-height: 24px; }
+        .transcript {
+            background: #f5f5f5;
+            border-radius: 12px;
+            padding: 16px;
+            min-height: 120px;
+            max-height: 240px;
+            overflow-y: auto;
+            text-align: left;
+            margin-bottom: 24px;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .message { margin-bottom: 12px; padding: 8px 12px; border-radius: 8px; }
+        .message.user { background: #e0e7ff; color: #4f46e5; }
+        .message.assistant { background: #fff; border: 1px solid #e5e7eb; color: #333; }
+        .message-label { font-size: 11px; font-weight: 600; margin-bottom: 4px; opacity: 0.7; }
+        .controls { display: flex; gap: 12px; justify-content: center; }
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 24px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(102,126,234,0.4); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎙️ TechFlow 语音客服</h1>
+        <p class="subtitle">Azure Speech SDK 浏览器版</p>
+
+        <div class="status" id="statusText">点击"开始通话"启用麦克风</div>
+
+        <div class="transcript" id="transcript">
+            <div style="font-size: 12px; color: #999; line-height: 1.5;">
+                💡 使用说明<br>
+                • 点击"开始通话"授权麦克风<br>
+                • 直接说话，自动识别<br>
+                • AI 实时回复并朗读
+            </div>
+        </div>
+
+        <div class="controls">
+            <button class="btn" id="startBtn" onclick="startConversation()">开始通话</button>
+            <button class="btn" id="stopBtn" onclick="stopConversation()" disabled>结束通话</button>
+        </div>
+    </div>
+
+    <!-- Azure Speech SDK -->
+    <script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
+
+    <script>
+        let ws = null;
+        let sessionId = null;
+        let recognizer = null;
+        let synthesizer = null;
+        let isSpeaking = false;  // AI 是否正在说话
+        let speechConfig = null;  // Azure Speech 配置（从后端获取）
+
+        // WebSocket 连接
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket 连接成功');
+            };
+
+            ws.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                handleWebSocketMessage(message);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket 错误:', error);
+                showError('连接错误');
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket 已关闭');
+            };
+        }
+
+        // 处理 WebSocket 消息
+        function handleWebSocketMessage(message) {
+            console.log('收到消息:', message);
+
+            switch (message.type) {
+                case 'session_info':
+                    sessionId = message.session_id;
+                    break;
+
+                case 'user_message':
+                    addMessage('user', message.text);
+                    setStatus('AI 正在思考...');
+                    break;
+
+                case 'assistant_message':
+                    addMessage('assistant', message.text);
+                    speakText(message.text);  // TTS 播放
+                    break;
+
+                case 'error':
+                    showError(message.message);
+                    setStatus('发生错误');
+                    break;
+
+                case 'info':
+                    setStatus(message.message);
+                    break;
+            }
+        }
+
+        // 开始通话
+        async function startConversation() {
+            try {
+                // 1. 获取 Azure Speech 配置
+                setStatus('正在获取配置...');
+                const configResponse = await fetch('/api/speech-config');
+                if (!configResponse.ok) {
+                    throw new Error('无法获取语音配置');
+                }
+                speechConfig = await configResponse.json();
+                console.log('获取到 Speech 配置:', { region: speechConfig.region });
+
+                // 2. 连接 WebSocket
+                if (!ws || ws.readyState !== WebSocket.OPEN) {
+                    connectWebSocket();
+                    await new Promise((resolve) => {
+                        const check = setInterval(() => {
+                            if (ws && ws.readyState === WebSocket.OPEN) {
+                                clearInterval(check);
+                                resolve();
+                            }
+                        }, 100);
+                    });
+                }
+
+                // 3. 初始化 Azure Speech SDK
+                const azureSpeechConfig = SpeechSDK.SpeechConfig.fromSubscription(
+                    speechConfig.key,
+                    speechConfig.region
+                );
+                azureSpeechConfig.speechRecognitionLanguage = speechConfig.language || "zh-CN";
+                azureSpeechConfig.speechSynthesisVoiceName = speechConfig.voice_name || "zh-CN-XiaoxiaoNeural";
+
+                // 4. 初始化识别器（连续识别）
+                const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+                recognizer = new SpeechSDK.SpeechRecognizer(azureSpeechConfig, audioConfig);
+
+                // 识别事件
+                recognizer.recognized = (s, e) => {
+                    if (e.result.reason === SpeechSDK.ResultReason.RecognizedSpeech) {
+                        const text = e.result.text;
+                        console.log('识别到:', text);
+
+                        // 发送到后端（不在AI说话时）
+                        if (ws && ws.readyState === WebSocket.OPEN && !isSpeaking) {
+                            ws.send(JSON.stringify({
+                                type: 'text',
+                                data: text
+                            }));
+                        }
+                    }
+                };
+
+                recognizer.canceled = (s, e) => {
+                    console.error('识别取消:', e.errorDetails);
+                    recognizer.stopContinuousRecognitionAsync();
+                };
+
+                // 开始连续识别
+                recognizer.startContinuousRecognitionAsync();
+
+                // 5. 初始化合成器
+                synthesizer = new SpeechSDK.SpeechSynthesizer(azureSpeechConfig);
+
+                // 6. 更新 UI
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+                setStatus('正在监听...');
+
+            } catch (error) {
+                console.error('启动失败:', error);
+                showError('无法启动: ' + error.message);
+            }
+        }
+
+        // 停止通话
+        function stopConversation() {
+            if (recognizer) {
+                recognizer.stopContinuousRecognitionAsync();
+                recognizer.close();
+                recognizer = null;
+            }
+
+            if (synthesizer) {
+                synthesizer.close();
+                synthesizer = null;
+            }
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            setStatus('通话已结束');
+        }
+
+        // TTS 播放
+        function speakText(text) {
+            if (!synthesizer) return;
+
+            isSpeaking = true;
+            setStatus('AI 正在说话...');
+
+            synthesizer.speakTextAsync(
+                text,
+                result => {
+                    if (result.reason === SpeechSDK.ResultReason.SynthesizingAudioCompleted) {
+                        console.log('TTS 播放完成');
+                        isSpeaking = false;
+                        setStatus('正在监听...');
+                    }
+                },
+                error => {
+                    console.error('TTS 失败:', error);
+                    isSpeaking = false;
+                    setStatus('正在监听...');
+                }
+            );
+        }
+
+        // UI 更新函数
+        function setStatus(text) {
+            document.getElementById('statusText').textContent = text;
+        }
+
+        function addMessage(role, text) {
+            const transcript = document.getElementById('transcript');
+            const message = document.createElement('div');
+            message.className = `message ${role}`;
+
+            const label = role === 'user' ? '你' : 'AI';
+            message.innerHTML = `
+                <div class="message-label">${label}</div>
+                <div>${text}</div>
+            `;
+
+            transcript.appendChild(message);
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
+        function showError(message) {
+            const transcript = document.getElementById('transcript');
+            const error = document.createElement('div');
+            error.style.cssText = 'background: #fee; color: #c33; padding: 12px; border-radius: 8px; margin-bottom: 12px;';
+            error.textContent = '❌ ' + message;
+            transcript.appendChild(error);
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
+        // 页面关闭时清理
+        window.addEventListener('beforeunload', () => {
+            stopConversation();
+        });
+    </script>
+</body>
+</html>

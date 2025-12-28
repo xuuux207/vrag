@@ -29,6 +29,7 @@ class VoiceAssistant:
         llm_service,
         context_manager,
         system_prompt: Optional[str] = None,
+        enable_tts_playback: bool = True,
     ):
         """
         初始化语音助手
@@ -40,12 +41,16 @@ class VoiceAssistant:
             llm_service: LLM服务
             context_manager: 上下文管理器
             system_prompt: 系统提示词
+            enable_tts_playback: 是否启用TTS播放（Web模式设为False）
         """
         self.stt = stt_service
         self.tts = tts_service
         self.rag = rag_searcher
         self.llm = llm_service
         self.context_mgr = context_manager
+
+        # Web模式配置
+        self.enable_tts_playback = enable_tts_playback
 
         # 初始化RAG判断Agent
         self.rag_decision_agent = RAGDecisionAgent()
@@ -95,6 +100,8 @@ class VoiceAssistant:
         self.on_assistant_response: Optional[Callable[[str], None]] = None
         self.on_rag_retrieved: Optional[Callable[[Dict], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
+        self.on_audio_ready: Optional[Callable[[str, int, bytes], None]] = None  # Web模式音频回调
+        self.on_generation_complete: Optional[Callable[[str], None]] = None  # LLM生成完成回调（通知前端所有音频已入队）
 
     def _default_system_prompt(self) -> str:
         """默认系统提示词"""
@@ -151,6 +158,27 @@ class VoiceAssistant:
 
         # 停止TTS worker
         self._stop_tts_worker()
+
+    def process_text_input(self, text: str):
+        """
+        处理文本输入（供Web模式调用）
+
+        Args:
+            text: 用户输入文本（已通过STT识别）
+        """
+        if not text or not text.strip():
+            logger.warning("收到空文本输入")
+            return
+
+        logger.info(f"处理文本输入: {text[:50]}...")
+
+        # 确保TTS worker已启动
+        if not self.is_running:
+            self.is_running = True
+            self._start_tts_worker()
+
+        # Web模式：STT已返回完整句子，直接处理（跳过完整性判断，避免4秒等待）
+        self._start_processing(text)
 
     def _start_tts_worker(self):
         """启动持久TTS工作线程（合成+播放）"""
@@ -302,13 +330,22 @@ class VoiceAssistant:
                     logger.debug(f"检测到中断信号，跳过播放 #{next_play_index}")
                     continue
 
-                # 播放
+                # 播放或回调
                 try:
                     self.is_tts_playing = True
                     logger.debug(f"TTS播放 #{next_play_index}")
-                    self.tts.reset_playback_flag()
-                    self.tts.play_audio_bytes(audio_data)
-                    logger.debug(f"TTS播放完成 #{next_play_index}")
+
+                    if self.enable_tts_playback:
+                        # 本地模式：播放音频
+                        self.tts.reset_playback_flag()
+                        self.tts.play_audio_bytes(audio_data)
+                        logger.debug(f"TTS播放完成 #{next_play_index}")
+                    else:
+                        # Web模式：触发回调
+                        if self.on_audio_ready:
+                            self.on_audio_ready(session_id, next_play_index, audio_data)
+                            logger.debug(f"TTS回调完成 #{next_play_index}")
+
                     next_play_index += 1
                 except Exception as e:
                     logger.error(f"TTS播放 #{next_play_index} 失败: {str(e)}")
@@ -722,6 +759,10 @@ class VoiceAssistant:
         # 触发回调
         if self.on_assistant_response:
             self.on_assistant_response(full_response)
+
+        # 触发生成完成回调（通知前端所有音频已入队，可以等待播放完成）
+        if self.on_generation_complete:
+            self.on_generation_complete(session_id)
 
         return full_response
 
