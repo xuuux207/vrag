@@ -47,6 +47,9 @@ class VoiceWebSocketHandler:
         self.session.assistant.on_user_speech = lambda text: safe_callback(
             self.send_json({"type": "user_message", "text": text})
         )
+        self.session.assistant.on_assistant_chunk = lambda chunk: safe_callback(
+            self.send_json({"type": "assistant_chunk", "chunk": chunk})
+        )
         self.session.assistant.on_assistant_response = lambda text: safe_callback(
             self.send_json({"type": "assistant_message", "text": text, "rag_used": False})
         )

@@ -100,6 +100,7 @@ class VoiceAssistant:
         # 回调函数
         self.on_user_speech: Optional[Callable[[str], None]] = None
         self.on_assistant_response: Optional[Callable[[str], None]] = None
+        self.on_assistant_chunk: Optional[Callable[[str], None]] = None  # 流式chunk回调
         self.on_rag_retrieved: Optional[Callable[[Dict], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
         self.on_audio_ready: Optional[Callable[[str, int, bytes], None]] = None  # Web模式音频回调
@@ -706,6 +707,10 @@ class VoiceAssistant:
             # logger.info(f"[LLM] chunk: {repr(chunk)}")
             full_response += chunk
             sentence_buffer += chunk
+
+            # 触发流式chunk回调（实时发送到前端）
+            if self.on_assistant_chunk:
+                self.on_assistant_chunk(chunk)
 
             # 优先检测强句子边界（。！？\n）
             strong_parts = re.split(r'([。！？\n])', sentence_buffer)

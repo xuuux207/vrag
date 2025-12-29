@@ -129,7 +129,9 @@ class QwenService:
             # 仅远程API支持extra_body参数
             if not self.is_local_vllm:
                 request_params["extra_body"] = {"enable_thinking": False}
-
+            else:
+                request_params["extra_body"]= {"chat_template_kwargs":{"enable_thinking": False}}
+                
             # 使用OpenAI SDK进行非流式调用
             response = self.client.chat.completions.create(**request_params)
 
