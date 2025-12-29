@@ -550,10 +550,10 @@ class VoiceAssistant:
 
         try:
             # ===== 步骤1: 判断是否需要RAG =====
-            # should_rag = self.rag_decision_agent.should_use_rag(
-            #     user_text,
-            #     self.messages[-6:] if self.messages else []
-            # )
+            should_rag = self.rag_decision_agent.should_use_rag(
+                user_text,
+                self.messages[-6:] if self.messages else []
+            )
             should_rag = True  # 临时：跳过判断，全部使用RAG
             logger.info(f"[1/6] RAG需求判断: {'需要' if should_rag else '不需要'}")
 
