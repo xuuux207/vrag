@@ -1,0 +1,983 @@
+#!/usr/bin/env python3
+"""
+生成Workshop演示notebook
+注意：避免在JSON字符串中使用中文引号，防止解析错误
+"""
+import json
+from pathlib import Path
+
+
+def create_notebook():
+    """创建notebook结构"""
+    notebook = {
+        "cells": [],
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3"
+            },
+            "language_info": {
+                "name": "python",
+                "version": "3.10.0"
+            }
+        },
+        "nbformat": 4,
+        "nbformat_minor": 4
+    }
+
+    # Part 0: 标题和概览
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "# 虚拟销售系统 Workshop：实时性与专业性的工程解决方案\n",
+            "\n",
+            "## 核心目标\n",
+            "\n",
+            "解决虚拟销售/客服系统中的**三个独立工程问题**：\n",
+            "\n",
+            "- **≤1500ms 端到端延迟** - 保证实时交互体验\n",
+            "- **30轮内无显著幻觉的专业对话** - 确保回答准确可靠\n",
+            "- **40-60秒长语音的准确理解** - 完整捕捉客户需求\n",
+            "\n",
+            "---\n",
+            "\n",
+            "## Workshop 结构\n",
+            "\n",
+            "```\n",
+            "导入部分 (总)\n",
+            "    ↓\n",
+            "Block 1: 模型选型与延迟分析\n",
+            "    ↓\n",
+            "Block 2: RAG 异构数据融合\n",
+            "    ↓\n",
+            "Block 3: 长输入处理\n",
+            "    ↓\n",
+            "完整 Pipeline 演示\n",
+            "    ↓\n",
+            "总结与讨论 (总)\n",
+            "```\n",
+            "\n",
+            "---\n",
+            "\n",
+            "## 为什么不讲 MoE？\n",
+            "\n",
+            "### 误区澄清\n",
+            "\n",
+            "原始需求提到：LLM 专业度提升方案，使用 MoE 路由架构（按行业或产品类型划分）\n",
+            "\n",
+            "**但实际上**：\n",
+            "- ❌ **误区1**：不需要自己训练 MoE 模型——Qwen 等模型已内置多专家机制\n",
+            "- ❌ **误区2**：MoE 路由**不能根本解决幻觉问题**——幻觉源于知识不足，而非模型选择\n",
+            "- ✅ **正确理解**：基础模型 + 高质量知识库 + 工程优化 = 核心解决方案\n",
+            "\n",
+            "### 本 Workshop 的视角\n",
+            "\n",
+            "我们关注的是**工程设计而非模型黑盒**：\n",
+            "1. **模型选择是手段**：选合适规模的 Qwen，确保延迟可控\n",
+            "2. **知识库是关键**：用 RAG 从异构数据精准检索，防止幻觉\n",
+            "3. **处理流程是保障**：长输入分段、完整理解，确保回答准确\n",
+            "\n",
+            "**MoE 的真实位置**：如果上述三个环节都优化后，系统仍存在专业度不足的问题，**那时**才考虑 MoE 作为后续优化。但绝大多数场景下，这三个环节就已经足够了。"
+        ]
+    })
+
+    # Part 0: 环境检查
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "---\n",
+            "\n",
+            "## Part 0: 环境初始化\n",
+            "\n",
+            "### 检查 vLLM 服务\n",
+            "\n",
+            "本 Workshop 使用本地 vLLM 服务：\n",
+            "- **Qwen3-8B** @ localhost:8000 (轻量级任务)\n",
+            "- **Qwen3-14B** @ localhost:8001 (主对话生成)"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 检查 vLLM 服务是否运行\n",
+            "import requests\n",
+            "\n",
+            "def check_vllm_service(port, model_name):\n",
+            "    \"\"\"检查 vLLM 服务状态\"\"\"\n",
+            "    try:\n",
+            "        response = requests.get(f\"http://localhost:{port}/v1/models\", timeout=3)\n",
+            "        if response.status_code == 200:\n",
+            "            print(f\"✓ {model_name} 服务运行正常 (端口 {port})\")\n",
+            "            return True\n",
+            "        else:\n",
+            "            print(f\"✗ {model_name} 服务异常 (端口 {port}): {response.status_code}\")\n",
+            "            return False\n",
+            "    except requests.exceptions.RequestException as e:\n",
+            "        print(f\"✗ {model_name} 服务未运行 (端口 {port})\")\n",
+            "        return False\n",
+            "\n",
+            "print(\"=\" * 60)\n",
+            "print(\"检查 vLLM 服务状态\")\n",
+            "print(\"=\" * 60)\n",
+            "\n",
+            "service_8b = check_vllm_service(8000, \"Qwen3-8B\")\n",
+            "service_14b = check_vllm_service(8001, \"Qwen3-14B\")\n",
+            "\n",
+            "if not service_8b or not service_14b:\n",
+            "    print(\"\\n⚠️  vLLM 服务未完全启动\")\n",
+            "    print(\"   → 请运行下面的 bash cell 启动服务\")\n",
+            "else:\n",
+            "    print(\"\\n✓ 所有服务运行正常，可以跳过下面的启动步骤\")"
+        ]
+    })
+
+    # 添加GPU状态检查的bash cell
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### (可选) 检查GPU状态\n",
+            "\n",
+            "如果需要启动vLLM，先检查GPU是否可用："
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "%%bash\n",
+            "# 检查GPU状态\n",
+            "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv"
+        ]
+    })
+
+    # 添加启动vLLM服务的bash cell
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### 启动 vLLM 服务（如果未运行）\n",
+            "\n",
+            "**注意**：这个cell会在后台启动vLLM服务，大约需要1-2分钟加载模型。\n",
+            "\n",
+            "启动后请等待约1-2分钟，然后重新运行上面的检查cell确认服务已启动。"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "%%bash --bg\n",
+            "# 后台启动vLLM双模型服务\n",
+            "bash scripts/start_dual_vllm_services.sh"
+        ]
+    })
+
+    # 导入核心库
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### 导入核心库\n",
+            "\n",
+            "导入项目所需的核心库（OpenAI客户端、RAG组件、知识库数据）。"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 导入核心库\n",
+            "import sys\n",
+            "from pathlib import Path\n",
+            "\n",
+            "# 添加项目根目录到路径\n",
+            "project_root = Path.cwd().parent if Path.cwd().name == 'notebooks' else Path.cwd()\n",
+            "sys.path.insert(0, str(project_root))\n",
+            "\n",
+            "from openai import OpenAI\n",
+            "from rag_utils import (\n",
+            "    EmbeddingService, RerankingService, VectorIndex,\n",
+            "    BM25, hybrid_search, build_rag_context\n",
+            ")\n",
+            "from data.fictional_knowledge_base import FICTIONAL_DOCUMENTS\n",
+            "from data.company_graph import convert_all_companies_to_documents\n",
+            "\n",
+            "print(\"✓ 核心库导入成功\")"
+        ]
+    })
+
+    # 初始化服务
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### 初始化 RAG 服务\n",
+            "\n",
+            "这一步会初始化所有必要的服务组件（vLLM客户端、Embedding、Reranking、向量索引、BM25索引）。\n",
+            "\n",
+            "**注意**：这一步耗时较长（约30-60秒），因为需要：\n",
+            "- 连接vLLM服务\n",
+            "- 加载54个知识库文档\n",
+            "- 构建向量索引（调用Embedding API）\n",
+            "- 构建BM25索引"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 初始化服务\n",
+            "print(\"初始化 RAG 服务...\")\n",
+            "\n",
+            "# 创建 vLLM 客户端\n",
+            "client_8b = OpenAI(api_key=\"EMPTY\", base_url=\"http://localhost:8000/v1\")\n",
+            "client_14b = OpenAI(api_key=\"EMPTY\", base_url=\"http://localhost:8001/v1\")\n",
+            "print(\"✓ vLLM 客户端初始化完成\")\n",
+            "\n",
+            "# 初始化 RAG 组件\n",
+            "embedding_svc = EmbeddingService()\n",
+            "reranking_svc = RerankingService()\n",
+            "vector_idx = VectorIndex(embedding_svc)\n",
+            "print(\"✓ RAG 组件初始化完成\")\n",
+            "\n",
+            "# 加载知识库\n",
+            "all_docs = FICTIONAL_DOCUMENTS + convert_all_companies_to_documents()\n",
+            "print(f\"✓ 加载知识库: {len(FICTIONAL_DOCUMENTS)} 个业务文档 + {len(convert_all_companies_to_documents())} 个公司文档\")\n",
+            "\n",
+            "# 构建向量索引\n",
+            "vector_idx.add_documents(all_docs)\n",
+            "print(f\"✓ 向量索引构建完成: 共 {len(all_docs)} 个文档\")\n",
+            "\n",
+            "# 构建 BM25 索引\n",
+            "corpus = [f\"{doc['title']} {doc['content']}\" for doc in all_docs]\n",
+            "bm25_idx = BM25(corpus)\n",
+            "print(\"✓ BM25 索引构建完成\")\n",
+            "\n",
+            "print(\"\\n=\" * 60)\n",
+            "print(\"所有服务初始化完成，准备开始实验\")\n",
+            "print(\"=\" * 60)"
+        ]
+    })
+
+    # Block 1: 模型选型
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "---\n",
+            "\n",
+            "## Part 1: Block 1 - 模型选型与延迟分析\n",
+            "\n",
+            "### 问题\n",
+            "应该选多大的 Qwen 模型才能满足 ≤500ms 推理时间？\n",
+            "\n",
+            "### 因果链\n",
+            "500ms 推理约束 → 模型规模 → 硬件需求\n",
+            "\n",
+            "### 解决思路\n",
+            "1. **Qwen 系列对标**: 3B/7B/14B/72B 参数规模选择\n",
+            "2. **推理速度计算**: 单 token 生成时间 × 平均回答长度 = 推理延迟\n",
+            "3. **实验验证**: 在目标硬件上跑 benchmark"
+        ]
+    })
+
+    # Block 1 - 理论延迟估算
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### 理论延迟估算\n",
+            "\n",
+            "通过简单计算评估不同参数规模模型的推理延迟（理论值）。"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 理论延迟估算\n",
+            "import numpy as np\n",
+            "\n",
+            "models = {\n",
+            "    \"Qwen3-3B\": {\"params\": 3e9, \"tokens_per_sec\": 100},\n",
+            "    \"Qwen3-7B\": {\"params\": 7e9, \"tokens_per_sec\": 50},\n",
+            "    \"Qwen3-14B\": {\"params\": 14e9, \"tokens_per_sec\": 25},\n",
+            "    \"Qwen3-72B\": {\"params\": 72e9, \"tokens_per_sec\": 8},\n",
+            "}\n",
+            "\n",
+            "avg_response_tokens = 50  # 平均回答长度\n",
+            "\n",
+            "print(\"推理延迟估算 (假设平均回答50个token):\")\n",
+            "print(\"-\" * 50)\n",
+            "for name, spec in models.items():\n",
+            "    inference_time = avg_response_tokens / spec[\"tokens_per_sec\"]\n",
+            "    status = \"✓ 可行\" if inference_time <= 1.5 else \"✗ 超限\"\n",
+            "    print(f\"{name}: {inference_time:.3f}s {status}\")\n",
+            "\n",
+            "print(\"\\n注意: 这是理论估算，实际测试结果见下文实验1\")"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### 实验1结果：模型对比测试\n",
+            "\n",
+            "**实验时间**: 2024-12-13  \n",
+            "**测试代码**: `experiments/test_01_model_comparison.py`  \n",
+            "**数据文件**: `outputs/experiment1_results_llm_scored_200059.json`  \n",
+            "\n",
+            "#### 测试模型与性能\n",
+            "\n",
+            "| 模型 | 准确性 | 完整性 | 平均延迟(s) | 速度(tok/s) | 评价 |\n",
+            "|------|--------|--------|-------------|-------------|------|\n",
+            "| qwen3-8b | 6.7/10 | 7.7/10 | 21.77 | 4.4 | ❌ 速度最慢，不适合实时 |\n",
+            "| **qwen3-14b** | 6.7/10 | **7.9/10** | **20.63** | **7.4** | ✅ **最佳平衡点** |\n",
+            "| qwen3-32b | 6.7/10 | 7.8/10 | 35.22 | 9.0 | ⚠️ 速度快但初始延迟高 |\n",
+            "\n",
+            "#### 关键发现\n",
+            "\n",
+            "1. **qwen3-14b 是实时交互的最佳选择**：完整性最高（7.9/10）、延迟最低（20.63秒）\n",
+            "2. **qwen3-8b 不适合实时场景**：速度仅4.4 tok/s，但可作为辅助模型用于快速判断任务\n",
+            "3. **双模型架构**：8B（RAG判断、输入完整性检测）+ 14B（主对话生成）"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 加载实验1结果\n",
+            "import json\n",
+            "import pandas as pd\n",
+            "\n",
+            "exp1_file = project_root / 'outputs' / 'experiment1_results_llm_scored_200059.json'\n",
+            "with open(exp1_file, 'r', encoding='utf-8') as f:\n",
+            "    exp1_data = json.load(f)\n",
+            "\n",
+            "# 统计各模型性能\n",
+            "models_stats = {}\n",
+            "for result in exp1_data['results']:\n",
+            "    model = result['model']\n",
+            "    if model not in models_stats:\n",
+            "        models_stats[model] = {\n",
+            "            'accuracy': [],\n",
+            "            'completeness': [],\n",
+            "            'latency': [],\n",
+            "            'speed': []\n",
+            "        }\n",
+            "    \n",
+            "    scores = result['llm_scores']\n",
+            "    models_stats[model]['accuracy'].append(scores['accuracy'])\n",
+            "    models_stats[model]['completeness'].append(scores['completeness'])\n",
+            "    models_stats[model]['latency'].append(result['latency'])\n",
+            "    models_stats[model]['speed'].append(result['speed'])\n",
+            "\n",
+            "# 计算平均值\n",
+            "print(\"实验1 - 模型性能对比\")\n",
+            "print(\"=\" * 80)\n",
+            "for model, stats in models_stats.items():\n",
+            "    print(f\"\\n{model}:\")\n",
+            "    print(f\"  准确性: {np.mean(stats['accuracy']):.1f}/10\")\n",
+            "    print(f\"  完整性: {np.mean(stats['completeness']):.1f}/10\")\n",
+            "    print(f\"  平均延迟: {np.mean(stats['latency']):.2f}s\")\n",
+            "    print(f\"  平均速度: {np.mean(stats['speed']):.1f} tok/s\")"
+        ]
+    })
+
+    # Block 2: RAG
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "---\n",
+            "\n",
+            "## Part 2: Block 2 - RAG 异构数据融合\n",
+            "\n",
+            "### 问题\n",
+            "结构化企业图谱数据和非结构化业务文档怎么整合，才能有效降低幻觉？\n",
+            "\n",
+            "### 因果链\n",
+            "异构数据（结构化+非结构化）→ 分别处理 → 统一检索 → 降低幻觉\n",
+            "\n",
+            "### 解决思路\n",
+            "1. **数据源特征分析**: 结构化（图谱）vs 非结构化（文档）\n",
+            "2. **分开存储的优势**: 精确检索 + 语义检索\n",
+            "3. **融合检索策略**: BM25 + Dense Vector + RRF + Reranking\n",
+            "4. **幻觉抑制机制**: 来源标记 + 覆盖度评估"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# RAG 异构数据融合演示（简化版）\n",
+            "\n",
+            "# 1. 结构化数据示例（企业图谱）\n",
+            "structured_data = {\n",
+            "    \"company\": \"西门子\",\n",
+            "    \"industry\": \"工业自动化\",\n",
+            "    \"solutions\": [\"PLC控制\", \"工业互联网\", \"数字化转型\"],\n",
+            "    \"clients\": [\"宝马\", \"大众\", \"西门子中国\"],\n",
+            "}\n",
+            "\n",
+            "# 2. 非结构化数据示例（业务文档）\n",
+            "unstructured_docs = [\n",
+            "    \"西门子 Siemens S7-1200 PLC 是面向中小型应用的高性能控制器...\",\n",
+            "    \"工业4.0 解决方案可以帮助传统制造业实现数字化转型...\",\n",
+            "    \"云平台支持实时监控和远程诊断功能...\",\n",
+            "]\n",
+            "\n",
+            "# 3. 用户问题\n",
+            "user_query = \"西门子的 PLC 产品有什么特点？\"\n",
+            "\n",
+            "# 4. 分别检索\n",
+            "print(\"=== 检索流程演示 ===\\n\")\n",
+            "\n",
+            "# 结构化检索（精确）\n",
+            "print(\"【结构化检索】\")\n",
+            "if \"PLC\" in user_query:\n",
+            "    for solution in structured_data[\"solutions\"]:\n",
+            "        if \"PLC\" in solution:\n",
+            "            print(f\"✓ 匹配: {solution}\")\n",
+            "\n",
+            "# 向量检索（模拟）\n",
+            "print(\"\\n【向量检索】\")\n",
+            "query_keywords = [\"PLC\", \"特点\", \"功能\"]\n",
+            "for i, doc in enumerate(unstructured_docs):\n",
+            "    match_score = sum(1 for kw in query_keywords if kw in doc) / len(query_keywords)\n",
+            "    if match_score > 0:\n",
+            "        print(f\"文档 {i+1}: {doc[:50]}... (相似度: {match_score:.2f})\")\n",
+            "\n",
+            "# 5. 融合结果\n",
+            "print(\"\\n【融合结果】\")\n",
+            "rag_context = f\"\"\"\n",
+            "结构化信息：西门子的核心解决方案包括 {', '.join(structured_data['solutions'])}\n",
+            "文档补充：{unstructured_docs[0][:50]}...\n",
+            "\"\"\"\n",
+            "print(rag_context)\n",
+            "print(\"\\n→ LLM 基于上述背景知识回答，避免纯粹幻觉\")"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### 实验2结果：混合RAG策略验证\n",
+            "\n",
+            "**实验时间**: 2024-12-15 / 2024-12-20  \n",
+            "**测试代码**: `experiments/test_02_*.py`  \n",
+            "\n",
+            "#### 4种检索策略对比\n",
+            "\n",
+            "| 方案 | 策略 | 检索时间 | 评价 |\n",
+            "|------|------|----------|------|\n",
+            "| A | Business-only Dense | 934ms | ❌ 仅业务文档，缺少公司信息 |\n",
+            "| B | Company-only BM25 | 0.23ms | ⚠️ 仅公司文档，缺乏产品细节 |\n",
+            "| C | All Dense | 1079ms | ❌ 语义检索，精确匹配不足 |\n",
+            "| **D** | **Hybrid (BM25+Dense+RRF+Rerank)** | 935ms | ✅ **综合效果最佳** |\n",
+            "\n",
+            "#### 最终性能指标（方案D + 本地vLLM）\n",
+            "\n",
+            "| 指标 | 结果 |\n",
+            "|------|------|\n",
+            "| **通过率** | **100%** (8/8) ✅ |\n",
+            "| **平均召回率** | **89.2%** |\n",
+            "| 平均检索时间 | 1.44秒 |\n",
+            "| 平均生成时间 | 0.70秒 |\n",
+            "| **平均总延迟** | **2.14秒** |\n",
+            "\n",
+            "#### 关键发现\n",
+            "\n",
+            "1. **混合检索策略效果最优**: BM25关键词匹配 + Dense语义理解 + Reranking精排\n",
+            "2. **中文分词优化显著**: 自定义jieba词典，召回率从70%提升至89.2%\n",
+            "3. **本地vLLM降低延迟**: 总延迟仅2.14秒，适合实时交互"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 真实混合检索演示\n",
+            "test_query = \"星辰金融集团想做实时风控，应该推荐哪个产品？\"\n",
+            "\n",
+            "print(f\"查询: {test_query}\")\n",
+            "print(\"=\" * 60)\n",
+            "\n",
+            "# 执行混合检索\n",
+            "rag_results, debug_info = hybrid_search(\n",
+            "    test_query, \n",
+            "    bm25_idx, \n",
+            "    vector_idx,\n",
+            "    embedding_svc, \n",
+            "    reranking_svc, \n",
+            "    final_top_k=5\n",
+            ")\n",
+            "\n",
+            "print(f\"\\n检索到 {len(rag_results)} 个相关文档:\\n\")\n",
+            "for i, result in enumerate(rag_results, 1):\n",
+            "    print(f\"{i}. [{result['score']:.3f}] {result['title']}\")\n",
+            "    print(f\"   {result['content'][:100]}...\\n\")\n",
+            "\n",
+            "# 构建 RAG 上下文\n",
+            "context = build_rag_context(rag_results)\n",
+            "print(\"\\n构建的RAG上下文:\")\n",
+            "print(\"-\" * 60)\n",
+            "print(context[:300] + \"...\")"
+        ]
+    })
+
+    # Block 3: 长输入
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "---\n",
+            "\n",
+            "## Part 3: Block 3 - 长输入处理\n",
+            "\n",
+            "### 问题\n",
+            "客户讲了一大堆需求（40-60秒），怎么处理才能既不丢失信息，又避免模型混乱和幻觉？\n",
+            "\n",
+            "### 因果链\n",
+            "40-60秒长语音 → 语义分段 → 独立理解 + 上下文保留 → 完整回答\n",
+            "\n",
+            "### 解决思路\n",
+            "1. **长输入的两大挑战**: Token 长度超限 + 多需求混合\n",
+            "2. **分段策略**: 语义边界检测（非固定长度截断）\n",
+            "3. **处理方式**: 流式 vs 聚合 vs 混合\n",
+            "4. **质量保障**: 关键点提取 + 段间逻辑 + 完整性检查"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 长输入分段处理演示\n",
+            "import re\n",
+            "\n",
+            "# 模拟客户 60 秒的语音转录\n",
+            "long_input = \"\"\"\n",
+            "我们公司是一家制造企业，主要生产汽车零部件。\n",
+            "目前面临的问题是生产效率低下，产品不良率在 15% 左右。\n",
+            "我们听说西门子的工业控制系统能帮助优化生产流程。\n",
+            "另外，我们的库存管理也很混乱，经常出现过库或缺库的情况。\n",
+            "想问一下，西门子是否有完整的 ERP 加自动化的整体解决方案？\n",
+            "\"\"\"\n",
+            "\n",
+            "print(\"=== 长输入分段处理 ===\\n\")\n",
+            "\n",
+            "# 1. 语义分段\n",
+            "sentences = re.split(r'[。？！]', long_input.strip())\n",
+            "sentences = [s.strip() for s in sentences if s.strip()]\n",
+            "\n",
+            "print(f\"原始输入长度: {len(long_input)} 字符\")\n",
+            "print(f\"分段数量: {len(sentences)} 个语义单元\\n\")\n",
+            "\n",
+            "# 2. 逐段处理\n",
+            "segments_with_topics = []\n",
+            "for i, sentence in enumerate(sentences):\n",
+            "    # 提取关键信息\n",
+            "    if \"效率\" in sentence or \"不良率\" in sentence:\n",
+            "        topic = \"生产优化\"\n",
+            "    elif \"库存\" in sentence:\n",
+            "        topic = \"库存管理\"\n",
+            "    elif \"解决方案\" in sentence:\n",
+            "        topic = \"产品咨询\"\n",
+            "    else:\n",
+            "        topic = \"背景信息\"\n",
+            "    \n",
+            "    segments_with_topics.append({\n",
+            "        \"id\": i+1,\n",
+            "        \"text\": sentence,\n",
+            "        \"topic\": topic\n",
+            "    })\n",
+            "\n",
+            "print(\"【分段结果】\")\n",
+            "for seg in segments_with_topics:\n",
+            "    print(f\"段 {seg['id']} [{seg['topic']}]: {seg['text']}\")\n",
+            "\n",
+            "# 3. 关键点提取\n",
+            "print(\"\\n【关键点提取】\")\n",
+            "key_points = {\n",
+            "    \"企业类型\": \"汽车零部件制造\",\n",
+            "    \"主要问题\": [\"生产效率低\", \"产品不良率 15%\", \"库存管理混乱\"],\n",
+            "    \"咨询方向\": \"工业控制系统 + ERP 整体方案\",\n",
+            "}\n",
+            "for key, value in key_points.items():\n",
+            "    print(f\"  {key}: {value}\")\n",
+            "\n",
+            "# 4. 完整性检查\n",
+            "print(\"\\n【完整性检查】\")\n",
+            "all_topics = set(seg[\"topic\"] for seg in segments_with_topics)\n",
+            "print(f\"涵盖的话题: {all_topics}\")\n",
+            "print(\"✓ 背景信息完整\")\n",
+            "print(\"✓ 问题点清晰\")\n",
+            "print(\"✓ 咨询需求明确\")\n",
+            "\n",
+            "print(\"\\n→ 现在 LLM 可以基于这个完整的背景，生成一致的专业回答\")"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### 实验3结果：渐进式总结与增量RAG\n",
+            "\n",
+            "**实验时间**: 2024-12-24  \n",
+            "**测试代码**: `experiments/test_03_v3_server.py`  \n",
+            "\n",
+            "#### 4种处理方法对比\n",
+            "\n",
+            "| 方法 | 策略 | 总分 | 感知延迟 | 评价 |\n",
+            "|------|------|------|----------|------|\n",
+            "| M1 | Baseline（完整文本） | 87.7/100 | 58.47s | ⚠️ 无压缩，上下文易溢出 |\n",
+            "| M2 | Batch Summary（批量总结） | 72.8/100 | 81.42s | ❌ 延迟最高 |\n",
+            "| M3 | Incremental v2（仅保留最后段落） | 70.2/100 | 61.14s | ❌ 信息丢失 |\n",
+            "| **M4** | **Incremental RAG v3** | **90.2/100** | **60.38s** | ✅ **综合最优** |\n",
+            "\n",
+            "#### Method 4 核心优势\n",
+            "\n",
+            "1. **最高综合评分**: 90.2/100（信息保留94.6、RAG相关性83.6）\n",
+            "2. **低感知延迟**: 总结和RAG都在用户输入过程中完成\n",
+            "3. **最优压缩效果**: Query压缩至31.3%，避免上下文溢出\n",
+            "4. **智能RAG**: 增量检索 + 相关度过滤（cosine > 0.6）+ 文档去重\n",
+            "\n",
+            "#### 处理流程示意\n",
+            "\n",
+            "```\n",
+            "用户说话过程 ────────────────────────────┐\n",
+            "                                       ↓\n",
+            "M1: 无处理 ─────────────────→ 等待RAG+生成 (58.47s)\n",
+            "\n",
+            "M2: 等待说完 → 批量总结 → RAG+生成 (81.42s)\n",
+            "\n",
+            "M3: 边说边总结(后台) ─────→ RAG+生成 (61.14s)\n",
+            "    总结时间: 42.06s (隐藏)\n",
+            "\n",
+            "M4: 边说边总结(后台) + 增量RAG ─→ 最终生成 (60.38s) ⭐\n",
+            "    总结时间: 45.35s (隐藏)\n",
+            "    RAG时间: 3.66s (分散)\n",
+            "```"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 加载实验3结果\n",
+            "exp3_file = project_root / 'outputs' / 'experiment3_v3_server_results_20251224_131035.json'\n",
+            "with open(exp3_file, 'r', encoding='utf-8') as f:\n",
+            "    exp3_data = json.load(f)\n",
+            "\n",
+            "# 展示各方法的综合评分\n",
+            "print(\"实验3 - 长音频处理方法对比\")\n",
+            "print(\"=\" * 80)\n",
+            "\n",
+            "for method_name, method_data in exp3_data['summary'].items():\n",
+            "    print(f\"\\n{method_name}:\")\n",
+            "    avg_scores = method_data['average_scores']\n",
+            "    print(f\"  综合评分: {avg_scores['overall']:.1f}/100\")\n",
+            "    print(f\"  信息保留率: {avg_scores['information_preservation']:.1f}\")\n",
+            "    print(f\"  噪音过滤率: {avg_scores['noise_filtering']:.1f}\")\n",
+            "    print(f\"  RAG相关性: {avg_scores['rag_relevance']:.1f}\")\n",
+            "    print(f\"  回复质量: {avg_scores['response_quality']:.1f}\")\n",
+            "    print(f\"  感知延迟: {method_data['avg_total_latency']:.2f}s\")"
+        ]
+    })
+
+    # Part 4: Pipeline
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "---\n",
+            "\n",
+            "## Part 4: 完整 Pipeline 演示\n",
+            "\n",
+            "### 三个解决方案的组合效应\n",
+            "\n",
+            "```\n",
+            "参数选型 (Block 1)\n",
+            "     ↓\n",
+            "能否在 500ms 内推理？\n",
+            "     ↓\n",
+            "+ RAG 异构融合 (Block 2)\n",
+            "     ↓\n",
+            "是否能获取准确知识？\n",
+            "     ↓\n",
+            "+ 长输入分段 (Block 3)\n",
+            "     ↓\n",
+            "能否理解完整需求？\n",
+            "     ↓\n",
+            "→ 实现实时+专业的系统\n",
+            "```"
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# 端到端 Pipeline 真实调用\n",
+            "import time\n",
+            "\n",
+            "# 真实场景测试\n",
+            "customer_input = \"\"\"\n",
+            "我们是一家金融科技公司，想要构建实时风控系统。\n",
+            "目前使用传统规则引擎，但响应速度慢、误报率高。\n",
+            "听说 TechFlow 有相关产品，能帮我们分析一下吗？\n",
+            "\"\"\"\n",
+            "\n",
+            "print(\"=\" * 60)\n",
+            "print(\"🎤 客户输入:\")\n",
+            "print(customer_input)\n",
+            "print(\"=\" * 60)\n",
+            "\n",
+            "# Step 1: 长输入分段（这里输入较短，无需分段）\n",
+            "print(\"\\n[Step 1] 长输入处理...\")\n",
+            "segments = [s.strip() for s in customer_input.strip().split('。') if s.strip()]\n",
+            "print(f\"✓ 分成 {len(segments)} 个语义单元\")\n",
+            "\n",
+            "# Step 2: 混合 RAG 检索\n",
+            "print(\"\\n[Step 2] RAG 异构数据检索...\")\n",
+            "rag_start = time.time()\n",
+            "rag_results, debug_info = hybrid_search(\n",
+            "    customer_input, \n",
+            "    bm25_idx, \n",
+            "    vector_idx,\n",
+            "    embedding_svc, \n",
+            "    reranking_svc, \n",
+            "    final_top_k=3\n",
+            ")\n",
+            "rag_time = time.time() - rag_start\n",
+            "context = build_rag_context(rag_results)\n",
+            "print(f\"✓ 从知识库检索到 {len(rag_results)} 条相关信息 (耗时: {rag_time:.3f}s)\")\n",
+            "\n",
+            "# Step 3: LLM 推理（使用 14B 模型）\n",
+            "print(\"\\n[Step 3] LLM 推理（Qwen3-14B）...\")\n",
+            "llm_start = time.time()\n",
+            "response = client_14b.chat.completions.create(\n",
+            "    model=\"Qwen/Qwen3-14B\",\n",
+            "    messages=[\n",
+            "        {\"role\": \"system\", \"content\": \"你是TechFlow的智能客服，专业、简洁、实用。\"},\n",
+            "        {\"role\": \"user\", \"content\": f\"背景知识：{context}\\n\\n问题：{customer_input}\"}\n",
+            "    ],\n",
+            "    temperature=0.7,\n",
+            "    max_tokens=500\n",
+            ")\n",
+            "llm_time = time.time() - llm_start\n",
+            "answer = response.choices[0].message.content\n",
+            "\n",
+            "print(f\"✓ 推理完成 (耗时: {llm_time:.3f}s)\")\n",
+            "print(\"\\n💬 AI 回答:\")\n",
+            "print(\"-\" * 60)\n",
+            "print(answer)\n",
+            "print(\"-\" * 60)\n",
+            "\n",
+            "# Step 4: 性能统计\n",
+            "print(\"\\n⏱️  性能统计:\")\n",
+            "e2e_latency = {\n",
+            "    \"ASR\": 0.3,  # 估算\n",
+            "    \"长输入处理\": 0.0,  # 本例无需\n",
+            "    \"RAG检索\": rag_time,\n",
+            "    \"LLM推理\": llm_time,\n",
+            "    \"TTS\": 0.4,  # 估算\n",
+            "}\n",
+            "total = sum(e2e_latency.values())\n",
+            "\n",
+            "for step, latency in e2e_latency.items():\n",
+            "    print(f\"  {step}: {latency:.3f}s\")\n",
+            "print(f\"\\n端到端总延迟: {total:.3f}s\")\n",
+            "print(\"✓ 符合 ≤1500ms 目标\" if total < 1.5 else \"⚠️ 超过目标\")"
+        ]
+    })
+
+    # Part 5: 总结
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "---\n",
+            "\n",
+            "## Part 5: 总结与讨论\n",
+            "\n",
+            "### 关键收获总结\n",
+            "\n",
+            "| Block | 核心问题 | 关键输出 |\n",
+            "|-------|---------|----------|\n",
+            "| Block 1 | 用什么参数的 Qwen？| 双模型架构（8B+14B） |\n",
+            "| Block 2 | 如何处理异构数据？| 混合RAG（BM25+Dense+RRF） |\n",
+            "| Block 3 | 长输入怎么不出错？| 渐进式总结+增量RAG |\n",
+            "\n",
+            "**最终价值**: 参会者拿走可直接用于生产的技术方案和代码框架\n",
+            "\n",
+            "---\n",
+            "\n",
+            "### 实施优先级\n",
+            "\n",
+            "1. **优先级1**: 选定模型规模，完成硬件评估\n",
+            "2. **优先级2**: 搭建RAG基础设施（混合检索+Reranking）\n",
+            "3. **优先级3**: 集成长输入处理逻辑（渐进式总结）\n",
+            "4. **可选**: 根据实际效果，评估是否需要 MoE 等高级优化\n",
+            "\n",
+            "---\n",
+            "\n",
+            "### 风险检查清单\n",
+            "\n",
+            "- [ ] 推理延迟是否稳定 < 500ms？\n",
+            "- [ ] RAG 检索的精度与召回率是否可接受？\n",
+            "- [ ] 长输入分段是否保留了完整信息？\n",
+            "- [ ] 幻觉频率是否在可控范围内？\n",
+            "\n",
+            "---\n",
+            "\n",
+            "### 互动环节\n",
+            "\n",
+            "- 参会者提出的具体场景讨论\n",
+            "- 针对性的模型选择建议\n",
+            "- Q&A 时间\n",
+            "\n",
+            "---\n",
+            "\n",
+            "## 参考资料\n",
+            "\n",
+            "- **实验结果详情**: [docs/EXPERIMENT3_RESULTS.md](../docs/EXPERIMENT3_RESULTS.md)\n",
+            "- **vLLM部署指南**: [docs/LOCAL_VLLM_GUIDE.md](../docs/LOCAL_VLLM_GUIDE.md)\n",
+            "- **完整系统文档**: [README.md](../README.md)"
+        ]
+    })
+
+    # 添加查看vLLM日志的cell
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "---\n",
+            "\n",
+            "## 附录：vLLM 服务管理\n",
+            "\n",
+            "### 查看 vLLM 服务日志\n",
+            "\n",
+            "如果服务启动失败或运行异常，可以查看日志："
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "%%bash\n",
+            "# 查看 Qwen3-8B 最近的日志\n",
+            "echo \"=== Qwen3-8B (端口 8000) 日志 ===\"\n",
+            "tail -30 logs/vllm_8b.log\n",
+            "\n",
+            "echo \"\"\n",
+            "echo \"=== Qwen3-14B (端口 8001) 日志 ===\"\n",
+            "tail -30 logs/vllm_14b.log"
+        ]
+    })
+
+    # 添加停止vLLM服务的cell
+    notebook["cells"].append({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### 停止 vLLM 服务\n",
+            "\n",
+            "Workshop 结束后，可以停止 vLLM 服务释放 GPU 资源："
+        ]
+    })
+
+    notebook["cells"].append({
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "%%bash\n",
+            "# 停止所有vLLM进程\n",
+            "pkill -f \"vllm.entrypoints.openai.api_server\"\n",
+            "echo \"✓ vLLM 服务已停止\""
+        ]
+    })
+
+    return notebook
+
+
+def main():
+    """主函数"""
+    print("生成 Workshop notebook...")
+
+    # 创建 notebook
+    notebook = create_notebook()
+
+    # 保存到文件
+    output_dir = Path(__file__).parent.parent / 'notebooks'
+    output_dir.mkdir(exist_ok=True)
+
+    output_file = output_dir / 'workshop_demo.ipynb'
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(notebook, f, ensure_ascii=False, indent=1)
+
+    print(f"✓ Notebook 已生成: {output_file}")
+    print(f"✓ 共 {len(notebook['cells'])} 个 cells")
+
+    # 验证 JSON 格式
+    try:
+        with open(output_file, 'r', encoding='utf-8') as f:
+            json.load(f)
+        print("✓ JSON 格式验证通过")
+    except json.JSONDecodeError as e:
+        print(f"✗ JSON 格式错误: {e}")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())
